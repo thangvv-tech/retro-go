@@ -1,0 +1,43 @@
+menu "Wireless Gamepad Configuration"
+
+    config GAMEPAD_SYSTEM_ID
+        int "System/Room ID (0 = accept all, 1-65535 = dedicated console pairing)"
+        default 0
+        range 0 65535
+        help
+            Identifier to pair with a specific Retro-Go console.
+            0 means open/public mode (matches any console accepting 0).
+            Set to a specific non-zero value (e.g. 1, 2) to isolate multiple consoles in the same room.
+
+    config GAMEPAD_WIFI_CHANNEL
+        int "WiFi Channel for ESP-NOW (must match Retro-Go console)"
+        default 1
+        range 1 14
+        help
+            Fixed WiFi channel used for ESP-NOW peer-to-peer transmission.
+            Default is 1 (matches Retro-Go fixed receiver channel).
+
+    config GAMEPAD_POLL_INTERVAL_MS
+        int "Hardware polling interval in milliseconds"
+        default 3
+        range 1 20
+        help
+            Sampling interval for button inputs. 3ms provides ~330Hz sampling rate.
+
+    config GAMEPAD_HEARTBEAT_INTERVAL_MS
+        int "Heartbeat keepalive interval in milliseconds"
+        default 16
+        range 5 100
+        help
+            Periodic transmission interval when button state does not change.
+            Default is 16ms to match 60 FPS video frame refresh rate.
+
+    config GAMEPAD_SLEEP_TIMEOUT_MS
+        int "Inactivity timeout before entering Light Sleep (ms)"
+        default 60000
+        range 5000 600000
+        help
+            Gamepad will enter light sleep (~1mA) after this period of inactivity.
+            Pressing any button will wake it up in < 3ms.
+
+endmenu

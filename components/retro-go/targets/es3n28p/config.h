@@ -63,6 +63,9 @@
     {RG_KEY_OPTION, .src = RG_KEY_SELECT | RG_KEY_A}, \
 }
 
+// Wireless Gamepad - ESP-NOW Receiver (P2P 2.4GHz for ESP32-C3 SuperMini)
+#define RG_GAMEPAD_USE_ESPNOW       1
+
 // Battery - IO9 ADC (200k/200k voltage divider on board -> 2:1 ratio)
 #define RG_BATTERY_DRIVER           1
 #define RG_BATTERY_ADC_UNIT         ADC_UNIT_1
@@ -70,8 +73,8 @@
 #define RG_BATTERY_CALC_PERCENT(raw) (((raw) * 2.f - 3500.f) / (4200.f - 3500.f) * 100.f)
 #define RG_BATTERY_CALC_VOLTAGE(raw) ((raw) * 2.f * 0.001f)
 
-// Status LED - WS2812B RGB LED on IO42
-#define RG_GPIO_LED                 GPIO_NUM_42
+// Status LED - WS2812B RGB LED on IO42 (disabled: requires RMT driver, not simple GPIO)
+// #define RG_GPIO_LED                 GPIO_NUM_42
 
 // SPI Display (ILI9341V)
 #define RG_GPIO_LCD_MISO            GPIO_NUM_13

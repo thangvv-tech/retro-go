@@ -38,9 +38,147 @@ static rg_keymap_serial_t keymap_serial[] = RG_GAMEPAD_SERIAL_MAP;
 #ifdef RG_GAMEPAD_VIRT_MAP
 static rg_keymap_virt_t keymap_virt[] = RG_GAMEPAD_VIRT_MAP;
 #endif
+
+static uint32_t gamepad_mapped = 0;
+
+#if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
+#include <esp_idf_version.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_event.h>
+#include <nvs_flash.h>
+
+#ifndef RG_GAMEPAD_WIFI_CHANNEL
+#define RG_GAMEPAD_WIFI_CHANNEL 1
+#endif
+
+#ifndef RG_GAMEPAD_SYSTEM_ID
+#define RG_GAMEPAD_SYSTEM_ID 0
+#endif
+
+#define RG_ESPNOW_GAMEPAD_MAGIC 0x4752 // 'R', 'G'
+
+typedef struct __attribute__((packed)) {
+    uint16_t magic;      // 0x4752 ('R', 'G')
+    uint16_t system_id;  // System/Console ID (0 = all, >0 = isolated room/console)
+    uint16_t buttons;    // Bitmask RG_KEY_*
+    uint8_t  seq;        // Packet sequence number (0-255)
+    uint8_t  player_id;  // 0 = Player 1, 1 = Player 2
+} rg_espnow_gamepad_packet_t;
+
+static volatile uint32_t espnow_player_state[2] = {0, 0};
+static int64_t espnow_last_packet_time[2] = {0, 0};
+static bool espnow_player_connected[2] = {false, false};
+static uint8_t espnow_player_mac[2][6];
+static bool espnow_player_bound[2] = {false, false};
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+static void espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len)
+{
+    const uint8_t *src_mac = esp_now_info->src_addr;
+#else
+static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data_len)
+{
+#endif
+    if (data_len < (int)sizeof(rg_espnow_gamepad_packet_t))
+        return;
+
+    const rg_espnow_gamepad_packet_t *packet = (const rg_espnow_gamepad_packet_t *)data;
+    if (packet->magic != RG_ESPNOW_GAMEPAD_MAGIC)
+        return; // Discard packets without Retro-Go magic header
+
+#if RG_GAMEPAD_SYSTEM_ID > 0
+    if (packet->system_id != RG_GAMEPAD_SYSTEM_ID)
+        return; // Discard packets destined for a different console in the room
+#endif
+
+    uint8_t player = packet->player_id & 1; // 0 = Player 1, 1 = Player 2
+    int64_t now = rg_system_timer();
+
+    // MAC binding & conflict protection (First-Come, First-Served)
+    if (espnow_player_bound[player])
+    {
+        if (memcmp(espnow_player_mac[player], src_mac, 6) != 0)
+        {
+            // Another gamepad is transmitting on the same player slot
+            // Only allow re-binding if currently bound gamepad timed out (> 1.5s idle/off)
+            if (now - espnow_last_packet_time[player] > 1500000)
+            {
+                memcpy(espnow_player_mac[player], src_mac, 6);
+                RG_LOGI("ESP-NOW: Player %d slot rebound to %02X:%02X:%02X:%02X:%02X:%02X",
+                        player + 1, src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+            }
+            else
+            {
+                // Slot is actively held by another gamepad -> ignore 3rd device
+                return;
+            }
+        }
+    }
+    else
+    {
+        memcpy(espnow_player_mac[player], src_mac, 6);
+        espnow_player_bound[player] = true;
+        RG_LOGI("ESP-NOW: Player %d bound to %02X:%02X:%02X:%02X:%02X:%02X",
+                player + 1, src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+    }
+
+    espnow_player_state[player] = (uint32_t)packet->buttons;
+    espnow_last_packet_time[player] = now;
+    if (!espnow_player_connected[player])
+    {
+        espnow_player_connected[player] = true;
+        RG_LOGI("ESP-NOW: Gamepad Player %d connected.", player + 1);
+    }
+}
+
+static void espnow_gamepad_init(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    wifi_mode_t mode;
+    if (esp_wifi_get_mode(&mode) != ESP_OK)
+    {
+        esp_netif_init();
+        esp_event_loop_create_default();
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        esp_wifi_init(&cfg);
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_wifi_start();
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(RG_GAMEPAD_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_ps(WIFI_PS_NONE); // Disable power-save: radio always listening for packets
+    }
+    else
+    {
+        esp_wifi_set_channel(RG_GAMEPAD_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+    }
+
+    if (esp_now_init() == ESP_OK)
+    {
+        esp_now_register_recv_cb(espnow_recv_cb);
+        RG_LOGI("ESP-NOW wireless gamepad receiver ready.");
+    }
+    else
+    {
+        RG_LOGW("Failed to initialize ESP-NOW.");
+    }
+
+    gamepad_mapped |= (RG_KEY_UP | RG_KEY_DOWN | RG_KEY_LEFT | RG_KEY_RIGHT |
+                       RG_KEY_A | RG_KEY_B | RG_KEY_X | RG_KEY_Y |
+                       RG_KEY_SELECT | RG_KEY_START | RG_KEY_MENU | RG_KEY_OPTION |
+                       RG_KEY_L | RG_KEY_R);
+}
+#endif
 static bool input_task_running = false;
 static uint32_t gamepad_state = -1; // _Atomic
-static uint32_t gamepad_mapped = 0;
 static rg_battery_t battery_state = {0};
 
 #define UPDATE_GLOBAL_MAP(keymap)                 \
@@ -335,6 +473,11 @@ void rg_input_init(void)
     UPDATE_GLOBAL_MAP(keymap_serial);
 #endif
 
+#if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
+    RG_LOGI("Initializing ESP-NOW wireless gamepad driver...");
+    espnow_gamepad_init();
+#endif
+
 
 #if RG_BATTERY_DRIVER == 1 /* ADC */
     RG_LOGI("Initializing ADC battery driver...");
@@ -378,12 +521,62 @@ bool rg_input_key_is_present(rg_key_t mask)
     return (gamepad_mapped & mask) == mask;
 }
 
-uint32_t rg_input_read_gamepad(void)
+uint32_t rg_input_read_player(int player)
 {
 #ifdef RG_TARGET_SDL2
     SDL_PumpEvents();
 #endif
-    return gamepad_state;
+    uint32_t state = 0;
+    if (player == 0)
+    {
+        state = gamepad_state;
+#if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
+        int64_t diff = rg_system_timer() - espnow_last_packet_time[0];
+        if (diff > 500000)
+        {
+            if (espnow_player_connected[0])
+            {
+                espnow_player_connected[0] = false;
+                RG_LOGI("ESP-NOW: Gamepad Player 1 disconnected.");
+            }
+            espnow_player_state[0] = 0;
+            if (diff > 1500000 && espnow_player_bound[0])
+            {
+                espnow_player_bound[0] = false;
+                RG_LOGI("ESP-NOW: Player 1 slot released for new controllers.");
+            }
+        }
+        state |= espnow_player_state[0];
+#endif
+    }
+    else if (player == 1)
+    {
+#if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
+        int64_t diff = rg_system_timer() - espnow_last_packet_time[1];
+        if (diff > 500000)
+        {
+            if (espnow_player_connected[1])
+            {
+                espnow_player_connected[1] = false;
+                RG_LOGI("ESP-NOW: Gamepad Player 2 disconnected.");
+            }
+            espnow_player_state[1] = 0;
+            if (diff > 1500000 && espnow_player_bound[1])
+            {
+                espnow_player_bound[1] = false;
+                RG_LOGI("ESP-NOW: Player 2 slot released for new controllers.");
+            }
+        }
+        state = espnow_player_state[1];
+#endif
+    }
+
+    return state;
+}
+
+uint32_t rg_input_read_gamepad(void)
+{
+    return rg_input_read_player(0) | rg_input_read_player(1);
 }
 
 bool rg_input_key_is_pressed(rg_key_t mask)

@@ -81,6 +81,108 @@ All buttons are configured as **Active Low (pulled to GND when pressed)**:
 
 ---
 
+### D. Dual PCF8574 Expansion Guide (Optional: 16 Buttons / L & R Support)
+
+To add shoulder buttons (`L`, `R`), `X`, `Y`, or dedicated `MENU`/`OPTION` buttons, connect a second PCF8574 module in parallel on the same I2C bus (**Header P4**).
+
+#### 1. Hardware Addressing & Bus Wiring
+- Both modules share **VCC**, **GND**, **SCL (GPIO 15)**, and **SDA (GPIO 16)** in parallel.
+- **Module 1 (`0x20`)**: Solder `A0=GND, A1=GND, A2=GND` (Primary 8 buttons: bit 0..7).
+- **Module 2 (`0x21`)**: Solder `A0=VCC, A1=GND, A2=GND` (Secondary 8 buttons: bit 8..15).
+
+```
+    ESP32-S3 (Header P4)
+    ├── SCL (IO15) ────────┬─── Module 1 SCL (0x20)
+    │                      └─── Module 2 SCL (0x21)
+    ├── SDA (IO16) ────────┬─── Module 1 SDA (0x20)
+    │                      └─── Module 2 SDA (0x21)
+    ├── +5V / 3.3V ────────┬─── Module 1 VCC
+    │                      └─── Module 2 VCC
+    └── GND ───────────────┴─── Common GND (all buttons & modules)
+```
+
+#### 2. Module 2 Pinout Mapping (Active Low to GND)
+| PCF8574 #2 Pin | Bit Position | Gamepad Button |
+| :---: | :---: | :--- |
+| **P0** | Bit 8 | **Button L (Shoulder Left)** |
+| **P1** | Bit 9 | **Button R (Shoulder Right)** |
+| **P2** | Bit 10 | **Button X (SNES)** |
+| **P3** | Bit 11 | **Button Y (SNES)** |
+| **P4** | Bit 12 | **Dedicated MENU Button** |
+| **P5** | Bit 13 | **Dedicated OPTION Button** |
+| **P6 - P7** | Bit 14 - 15 | Reserved / Unused |
+
+#### 3. Code Configuration (`config.h` & `rg_i2c.c`)
+- In `config.h`, expand `RG_GAMEPAD_I2C_MAP`:
+  ```c
+  #define RG_GAMEPAD_I2C_MAP { \
+      {RG_KEY_UP,     .num = 0,  .level = 0}, \
+      {RG_KEY_DOWN,   .num = 1,  .level = 0}, \
+      {RG_KEY_LEFT,   .num = 2,  .level = 0}, \
+      {RG_KEY_RIGHT,  .num = 3,  .level = 0}, \
+      {RG_KEY_A,      .num = 4,  .level = 0}, \
+      {RG_KEY_B,      .num = 5,  .level = 0}, \
+      {RG_KEY_SELECT, .num = 6,  .level = 0}, \
+      {RG_KEY_START,  .num = 7,  .level = 0}, \
+      {RG_KEY_L,      .num = 8,  .level = 0}, \
+      {RG_KEY_R,      .num = 9,  .level = 0}, \
+      {RG_KEY_MENU,   .num = 12, .level = 0}, \
+      {RG_KEY_OPTION, .num = 13, .level = 0}, \
+  }
+  ```
+- In `components/retro-go/rg_i2c.c`, update driver 5 (`PCF8574`) to define 2 ports with addresses `0x20` and `0x21` so `rg_i2c_gpio_read_port(0)` reads Module 1 and `rg_i2c_gpio_read_port(1)` reads Module 2. Retro-Go automatically combines both ports: `buttons = (data1 << 8) | data0` (`rg_input.c:143`).
+
+---
+
+### E. ESP32-C3 SuperMini Wireless Gamepad (ESP-NOW P2P)
+
+Retro-Go includes native **ESP-NOW wireless gamepad support** (`RG_GAMEPAD_USE_ESPNOW 1`). You can build an ultra-low latency (< 3ms) wireless handheld controller using an **ESP32-C3 SuperMini** board communicating over 2.4GHz broadcast (zero-configuration pairing).
+
+#### 1. Pinout Wiring (ESP32-C3 SuperMini to Buttons)
+All buttons connect directly between the GPIO pin and **GND** (Active Low using internal pull-up):
+
+| ESP32-C3 Pin | Gamepad Button | Retro-Go Key | Notes |
+| :---: | :--- | :--- | :--- |
+| **IO0** | **D-Pad UP** | `RG_KEY_UP` | Direction Up |
+| **IO1** | **D-Pad DOWN** | `RG_KEY_DOWN` | Direction Down |
+| **IO2** | **D-Pad LEFT** | `RG_KEY_LEFT` | Direction Left |
+| **IO3** | **D-Pad RIGHT** | `RG_KEY_RIGHT` | Direction Right |
+| **IO4** | **Button A** | `RG_KEY_A` | Action A (Jump / Accept) |
+| **IO5** | **Button B** | `RG_KEY_B` | Action B (Attack / Cancel) |
+| **IO6** | **Button X** | `RG_KEY_X` | SNES Button X |
+| **IO7** | **Button Y** | `RG_KEY_Y` | SNES Button Y |
+| **IO8** | **Button L** | `RG_KEY_L` | Shoulder Left |
+| **IO10** | **Button R** | `RG_KEY_R` | Shoulder Right |
+| **IO20** | **Button SELECT** | `RG_KEY_SELECT` | Select |
+| **IO21** | **Button START** | `RG_KEY_START` | Start |
+| **IO9** | **Button MENU** | `RG_KEY_MENU` | External switch wired to header pin 9 (do not use onboard SMD boot button) |
+| **GND** | **Common Ground** | | Connect to all 13 switches |
+
+> **Note on Simultaneous Inputs**:
+> Connecting and using the wireless gamepad does not disable the console's onboard physical buttons (PCF8574/GPIO). Both input sources are aggregated simultaneously (`onboard | wireless`), allowing dual control or instant hot-swapping.
+
+#### 2. Build & Flash Gamepad Firmware (ESP-IDF)
+The pure ESP-IDF project is located at `tools/gamepad/` (supports ESP32-C3, ESP32-S3, ESP32):
+
+```bash
+# 1. Load ESP-IDF environment
+. $HOME/esp/esp-idf/export.sh
+
+# 2. Enter gamepad directory
+cd tools/gamepad
+
+# 3. Target ESP32-C3 (or esp32s3 / esp32) and compile
+idf.py set-target esp32c3
+idf.py build
+
+# 4. Flash to ESP32-C3 SuperMini (1-step flash at offset 0x0)
+esptool.py --chip esp32c3 -p /dev/ttyUSB1 -b 460800 write_flash 0x0 build/gamepad.img
+```
+
+The gamepad immediately transmits button states via ESP-NOW broadcast (`FF:FF:FF:FF:FF:FF`). The ES3N28P board receives packets seamlessly and works simultaneously alongside any onboard buttons.
+
+---
+
 ## 3. GPIO Pinout Table
 
 ### Display (ILI9341V / SPI2)
@@ -146,7 +248,7 @@ All buttons are configured as **Active Low (pulled to GND when pressed)**:
 
 Retro-Go is composed of multiple sub-applications (Launcher UI + 4 emulator/game cores):
 1. **`launcher`**: Main system menu, file browser, audio/display settings, and save-state manager.
-2. **`retro-core`**: Multi-system emulator (NES, Game Boy, Game Boy Color, Game Boy Advance, Sega Master System, Game Gear, PC Engine, ColecoVision).
+2. **`retro-core`**: Multi-system emulator (NES, SNES, Game Boy, Game Boy Color, Game & Watch, Sega Master System, Game Gear, PC Engine, ColecoVision, Atari Lynx).
 3. **`gwenesis`**: Sega Genesis / Mega Drive emulator.
 4. **`prboom-go`**: Doom & Doom II engine port.
 5. **`fmsx`**: MSX / MSX2 home computer emulator.
@@ -187,26 +289,28 @@ esptool.py --chip esp32s3 -p /dev/ttyUSB0 -b 921600 write_flash 0x0 retro-go_*_e
 
 ## 5. MicroSD Card Setup
 
-Format your MicroSD Card with **FAT32** or **exFAT** and create the ROM directories:
+Format your MicroSD Card with **FAT32** and create the directory structure:
 
 ```
 /sd/
 ├── retro-go/
-│   ├── covers/
-│   └── saves/
+│   ├── bios/       # Optional BIOS files (gb, gbc, fds, msx)
+│   └── saves/      # Save states and SRAM (auto-created)
+├── romart/         # Cover artwork (e.g. /romart/nes/<gamename>.png)
 └── roms/
-    ├── nes/        # .nes, .fds
-    ├── snes/       # .smc, .sfc
-    ├── gb/         # .gb
-    ├── gbc/        # .gbc
-    ├── gba/        # .gba
-    ├── sega/       # .gen, .smd, .bin (Genesis / Mega Drive)
-    ├── gg/         # .gg (Game Gear)
-    ├── sms/        # .sms (Master System)
-    ├── pce/        # .pce (PC Engine / TurboGrafx-16)
-    ├── col/        # .col (ColecoVision)
-    ├── doom/       # .wad
-    └── wolf/       # .wl6
+    ├── nes/        # .nes, .fds, .nsf, .zip
+    ├── snes/       # .smc, .sfc, .zip
+    ├── gb/         # .gb, .gbc, .zip
+    ├── gbc/        # .gbc, .gb, .zip
+    ├── gw/         # .gw (Game & Watch)
+    ├── md/         # .md, .gen, .bin, .zip (Mega Drive / Genesis)
+    ├── sms/        # .sms, .sg, .zip (Master System / SG-1000)
+    ├── gg/         # .gg, .zip (Game Gear)
+    ├── pce/        # .pce, .zip (PC Engine / TurboGrafx-16)
+    ├── col/        # .col, .rom, .zip (ColecoVision)
+    ├── lnx/        # .lnx, .zip (Atari Lynx)
+    ├── doom/       # .wad, .zip
+    └── msx/        # .rom, .mx1, .mx2, .dsk
 ```
 
 ---
