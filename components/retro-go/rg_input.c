@@ -139,7 +139,8 @@ bool rg_input_read_gamepad_raw(uint32_t *out)
     int data0 = rg_i2c_gpio_read_port(0), data1 = rg_i2c_gpio_read_port(1);
     if (data0 > -1) // && data1 > -1)
     {
-        buttons = (data1 << 8) | (data0);
+        int p1 = (data1 > -1) ? data1 : 0;
+        buttons = (p1 << 8) | (data0);
 #elif defined(RG_TARGET_T_DECK_PLUS)
     uint8_t data[5];
     if (rg_i2c_read(T_DECK_KBD_ADDRESS, -1, &data, 5))

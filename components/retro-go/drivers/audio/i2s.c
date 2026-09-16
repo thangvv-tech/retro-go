@@ -12,6 +12,10 @@
 #include <driver/gpio.h>
 #include <driver/i2s.h>
 
+#ifdef RG_AUDIO_USE_ES8311
+#include "es8311.h"
+#endif
+
 #ifdef RG_GPIO_SND_AMP_ENABLE_INVERT
 #define MUTE_ENABLE 1
 #define MUTE_DISABLE 0
@@ -78,12 +82,23 @@ static bool driver_init(int device, int sample_rate)
         if (ret == ESP_OK)
         {
             ret = i2s_set_pin(I2S_NUM_0, &(i2s_pin_config_t) {
+            #ifdef RG_GPIO_SND_I2S_MCLK
+                .mck_io_num = RG_GPIO_SND_I2S_MCLK,
+            #else
                 .mck_io_num = GPIO_NUM_NC,
+            #endif
                 .bck_io_num = RG_GPIO_SND_I2S_BCK,
                 .ws_io_num = RG_GPIO_SND_I2S_WS,
                 .data_out_num = RG_GPIO_SND_I2S_DATA,
                 .data_in_num = GPIO_NUM_NC
             });
+        }
+        if (ret == ESP_OK)
+        {
+        #ifdef RG_AUDIO_USE_ES8311
+            if (!es8311_init(sample_rate))
+                RG_LOGW("ES8311 codec init failed, audio may not work.\n");
+        #endif
         }
         if (ret != ESP_OK)
             state.last_error = esp_err_to_name(ret);
@@ -190,6 +205,9 @@ static bool driver_submit(const rg_audio_frame_t *frames, size_t count)
 static bool driver_set_mute(bool mute)
 {
     i2s_zero_dma_buffer(I2S_NUM_0);
+    #ifdef RG_AUDIO_USE_ES8311
+    es8311_set_mute(mute);
+    #endif
     #ifdef RG_GPIO_SND_AMP_ENABLE
     gpio_set_level(RG_GPIO_SND_AMP_ENABLE, mute ? MUTE_ENABLE : MUTE_DISABLE);
     #endif
@@ -200,6 +218,9 @@ static bool driver_set_mute(bool mute)
 static bool driver_set_volume(int volume)
 {
     state.volume = volume;
+    #ifdef RG_AUDIO_USE_ES8311
+    es8311_set_volume(volume);
+    #endif
     return true;
 }
 
