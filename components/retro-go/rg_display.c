@@ -456,7 +456,7 @@ void rg_display_set_backlight(display_backlight_t percent)
 {
     config.backlight = RG_MIN(RG_MAX(percent, RG_DISPLAY_BACKLIGHT_MIN), RG_DISPLAY_BACKLIGHT_MAX);
     rg_settings_set_number(NS_GLOBAL, SETTING_BACKLIGHT, config.backlight);
-    lcd_set_backlight(config.backlight);
+    lcd_set_backlight((config.backlight * config.backlight) / 100.0f);
 }
 
 display_backlight_t rg_display_get_backlight(void)
@@ -645,7 +645,7 @@ void rg_display_init(void)
     lcd_init();
     rg_display_clear(C_BLACK);
     rg_task_delay(80); // Wait for the screen be cleared before turning on the backlight (40ms doesn't seem to be enough...)
-    lcd_set_backlight(config.backlight);
+    lcd_set_backlight((config.backlight * config.backlight) / 100.0f);
     display_task_queue = rg_task_create("rg_display", &display_task, NULL, 4 * 1024, RG_TASK_PRIORITY_6, 1);
     if (config.border_file)
         load_border_file(config.border_file);
