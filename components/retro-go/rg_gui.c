@@ -451,6 +451,8 @@ rg_rect_t rg_gui_draw_text(int x_pos, int y_pos, int width, const char *text, //
         if (!(flags & RG_TEXT_DUMMY_DRAW))
             draw_buffer = get_draw_buffer(draw_width, line_height, color_bg);
 
+        const char *line_start = ptr;
+
         while (x_offset < draw_width)
         {
             uint32_t bitmap[font_height];
@@ -460,7 +462,8 @@ rg_rect_t rg_gui_draw_text(int x_pos, int y_pos, int width, const char *text, //
 
             if (draw_width - x_offset < width) // Do not truncate glyphs
             {
-                if (flags & RG_TEXT_MULTILINE)
+                // Only rewind if at least one glyph already fit on this line
+                if ((flags & RG_TEXT_MULTILINE) && prev_ptr != line_start)
                     ptr = prev_ptr;
                 break;
             }
@@ -1417,11 +1420,11 @@ static rg_gui_event_t volume_update_cb(rg_gui_option_t *option, rg_gui_event_t e
     int prev_level = level;
 
     if (event == RG_DIALOG_PREV)
-        level -= 5;
+        level -= 10;
     if (event == RG_DIALOG_NEXT)
-        level += 5;
+        level += 10;
 
-    level -= (level % 5);
+    level -= (level % 10);
 
     if (level != prev_level)
         rg_audio_set_volume(level);

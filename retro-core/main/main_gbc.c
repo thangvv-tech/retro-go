@@ -309,6 +309,7 @@ void gbc_main(void)
         gnuboy_load_sram(sramFile);
 
     update_rtc_time();
+    app->frameskip = 0;
 
     // Ready!
 
