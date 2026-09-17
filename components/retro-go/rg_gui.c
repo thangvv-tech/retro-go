@@ -1760,7 +1760,7 @@ static rg_gui_event_t border_update_cb(rg_gui_option_t *option, rg_gui_event_t e
 static void wifi_toggle_interactive(bool enable, int slot)
 {
     rg_network_state_t target_state = enable ? RG_NETWORK_CONNECTED : RG_NETWORK_DISCONNECTED;
-    int64_t timeout = rg_system_timer() + 20 * 1000000;
+    int64_t timeout = rg_system_timer() + 10 * 1000000;
     rg_gui_draw_message(enable ? _("Connecting...") : _("Disconnecting..."));
     rg_network_wifi_stop();
     if (enable)
@@ -1773,7 +1773,7 @@ static void wifi_toggle_interactive(bool enable, int slot)
             const rg_wifi_config_t config = {
                 .ssid = "retro-go",
                 .password = "retro-go",
-                .channel = 6,
+                .channel = 1,
                 .ap_mode = true,
             };
             rg_network_wifi_set_config(&config);
@@ -1964,15 +1964,22 @@ static rg_gui_event_t wifi_access_point_cb(rg_gui_option_t *option, rg_gui_event
 
 static rg_gui_event_t wifi_enable_cb(rg_gui_option_t *option, rg_gui_event_t event)
 {
-    bool enabled = rg_settings_get_boolean(NS_WIFI, SETTING_WIFI_ENABLE, false);
+    rg_network_t info = rg_network_get_info();
+    bool is_running = (info.state > RG_NETWORK_DISCONNECTED);
+
     if (event == RG_DIALOG_PREV || event == RG_DIALOG_NEXT || event == RG_DIALOG_ENTER)
     {
-        enabled = !enabled;
-        rg_settings_set_boolean(NS_WIFI, SETTING_WIFI_ENABLE, enabled);
-        wifi_toggle_interactive(enabled, rg_settings_get_number(NS_WIFI, SETTING_WIFI_SLOT, -1));
+        bool enable = !is_running;
+        int slot = rg_settings_get_number(NS_WIFI, SETTING_WIFI_SLOT, 0);
+        if (slot < 0)
+            slot = 0;
+        rg_settings_set_boolean(NS_WIFI, SETTING_WIFI_ENABLE, enable);
+        rg_settings_set_number(NS_WIFI, SETTING_WIFI_SLOT, slot);
+        rg_settings_commit();
+        wifi_toggle_interactive(enable, slot);
         return RG_DIALOG_REDRAW;
     }
-    strcpy(option->value, enabled ? _("On") : _("Off"));
+    strcpy(option->value, is_running ? _("On") : _("Off"));
     return RG_DIALOG_VOID;
 }
 

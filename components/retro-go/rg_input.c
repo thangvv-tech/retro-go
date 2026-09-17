@@ -45,6 +45,7 @@ static uint32_t gamepad_mapped = 0;
 #include <esp_idf_version.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_netif.h>
 #include <esp_event.h>
 #include <nvs_flash.h>
 
@@ -61,7 +62,7 @@ static uint32_t gamepad_mapped = 0;
 typedef struct __attribute__((packed)) {
     uint16_t magic;      // 0x4752 ('R', 'G')
     uint16_t system_id;  // System/Console ID (0 = all, >0 = isolated room/console)
-    uint16_t buttons;    // Bitmask RG_KEY_*
+    uint16_t buttons;    // Bitmask RG_KEY_* (0xFFFF = ACK / PONG)
     uint8_t  seq;        // Packet sequence number (0-255)
     uint8_t  player_id;  // 0 = Player 1, 1 = Player 2
 } rg_espnow_gamepad_packet_t;
@@ -71,6 +72,7 @@ static int64_t espnow_last_packet_time[2] = {0, 0};
 static bool espnow_player_connected[2] = {false, false};
 static uint8_t espnow_player_mac[2][6];
 static bool espnow_player_bound[2] = {false, false};
+static const uint8_t espnow_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 static void espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len)
@@ -87,10 +89,23 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
     if (packet->magic != RG_ESPNOW_GAMEPAD_MAGIC)
         return; // Discard packets without Retro-Go magic header
 
+    if (packet->buttons == 0xFFFF)
+        return; // Discard ACK/loopback packet
+
 #if RG_GAMEPAD_SYSTEM_ID > 0
     if (packet->system_id != RG_GAMEPAD_SYSTEM_ID)
         return; // Discard packets destined for a different console in the room
 #endif
+
+    // Send ACK back so Gamepad can lock to current WiFi channel automatically
+    rg_espnow_gamepad_packet_t ack = {
+        .magic = RG_ESPNOW_GAMEPAD_MAGIC,
+        .system_id = packet->system_id,
+        .buttons = 0xFFFF,
+        .seq = packet->seq,
+        .player_id = packet->player_id,
+    };
+    esp_now_send(espnow_broadcast_mac, (const uint8_t *)&ack, sizeof(ack));
 
     uint8_t player = packet->player_id & 1; // 0 = Player 1, 1 = Player 2
     int64_t now = rg_system_timer();
@@ -146,6 +161,7 @@ static void espnow_gamepad_init(void)
     {
         esp_netif_init();
         esp_event_loop_create_default();
+        esp_netif_create_default_wifi_sta();
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         esp_wifi_init(&cfg);
         esp_wifi_set_mode(WIFI_MODE_STA);
@@ -163,6 +179,13 @@ static void espnow_gamepad_init(void)
 
     if (esp_now_init() == ESP_OK)
     {
+        esp_now_peer_info_t peer_info = {0};
+        memcpy(peer_info.peer_addr, espnow_broadcast_mac, 6);
+        peer_info.channel = 0; // Follow current WiFi channel
+        peer_info.ifidx = WIFI_IF_STA;
+        peer_info.encrypt = false;
+        esp_now_add_peer(&peer_info);
+
         esp_now_register_recv_cb(espnow_recv_cb);
         RG_LOGI("ESP-NOW wireless gamepad receiver ready.");
     }
