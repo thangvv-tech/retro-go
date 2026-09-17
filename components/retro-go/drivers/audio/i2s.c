@@ -218,9 +218,6 @@ static bool driver_set_mute(bool mute)
 static bool driver_set_volume(int volume)
 {
     state.volume = volume;
-    #ifdef RG_AUDIO_USE_ES8311
-    es8311_set_volume(volume);
-    #endif
     return true;
 }
 

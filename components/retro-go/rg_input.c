@@ -130,6 +130,15 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
     // 1. Explicit pairing request from gamepad
     if (packet->buttons == RG_ESPNOW_CMD_PAIR_REQ)
     {
+        // Prevent hijacking active player slot mid-game:
+        // If slot is actively held by another controller (< 2s idle), reject foreign pairing request
+        if (espnow_has_bonded_mac[player] && espnow_player_connected[player] &&
+            (now - espnow_last_packet_time[player] < 2000000) &&
+            memcmp(espnow_bonded_mac[player], src_mac, 6) != 0)
+        {
+            return;
+        }
+
         memcpy(espnow_player_mac[player], src_mac, 6);
         memcpy(espnow_bonded_mac[player], src_mac, 6);
         espnow_has_bonded_mac[player] = true;
@@ -172,6 +181,13 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
         espnow_save_bonded_mac(player, src_mac);
         RG_LOGI("ESP-NOW: Auto-bonded Player %d to MAC %02X:%02X:%02X:%02X:%02X:%02X",
                 player + 1, src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+    }
+
+    uint8_t active_radio_channel = espnow_current_channel;
+    wifi_second_chan_t second;
+    if (esp_wifi_get_channel(&active_radio_channel, &second) == ESP_OK && active_radio_channel > 0)
+    {
+        espnow_current_channel = active_radio_channel;
     }
 
     // Send ACK back with console MAC and current channel hint
@@ -237,7 +253,8 @@ static void espnow_gamepad_init(void)
     {
         esp_netif_init();
         esp_event_loop_create_default();
-        esp_netif_create_default_wifi_sta();
+        if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"))
+            esp_netif_create_default_wifi_sta();
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         esp_wifi_init(&cfg);
         esp_wifi_set_storage(WIFI_STORAGE_RAM);
@@ -290,6 +307,9 @@ void rg_input_espnow_notify_channel_switch(uint8_t new_channel)
     uint8_t old_chan = espnow_current_channel;
     espnow_current_channel = new_channel;
 
+    if (old_chan == new_channel)
+        return;
+
     rg_espnow_gamepad_packet_t switch_pkt = {
         .magic = RG_ESPNOW_GAMEPAD_MAGIC,
         .system_id = RG_GAMEPAD_SYSTEM_ID,
@@ -301,11 +321,31 @@ void rg_input_espnow_notify_channel_switch(uint8_t new_channel)
     };
     memcpy(switch_pkt.console_mac, console_self_mac, 6);
 
-    for (int i = 0; i < 4; i++)
+    uint8_t current_radio_chan = 0;
+    wifi_second_chan_t second_chan;
+    esp_wifi_get_channel(&current_radio_chan, &second_chan);
+
+    // 1. Transmit directly on old_chan so gamepad receives notice immediately
+    if (old_chan >= 1 && old_chan <= 13 && current_radio_chan != old_chan)
+    {
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(old_chan, WIFI_SECOND_CHAN_NONE);
+        for (int i = 0; i < 8; i++)
+        {
+            esp_now_send(espnow_broadcast_mac, (const uint8_t *)&switch_pkt, sizeof(switch_pkt));
+            esp_rom_delay_us(500);
+        }
+        esp_wifi_set_channel(current_radio_chan, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous(false);
+    }
+
+    // 2. Also transmit on current / new_channel
+    for (int i = 0; i < 8; i++)
     {
         esp_now_send(espnow_broadcast_mac, (const uint8_t *)&switch_pkt, sizeof(switch_pkt));
-        esp_rom_delay_us(200);
+        esp_rom_delay_us(500);
     }
+
     RG_LOGI("ESP-NOW: Broadcasted channel switch notice (%d -> %d).", old_chan, new_channel);
 }
 #endif

@@ -1,9 +1,23 @@
 #include "rg_system.h"
 #include "rg_network.h"
+#if defined(RG_GAMEPAD_USE_ESPNOW)
 #include "rg_input.h"
+#endif
 
 #include <stdlib.h>
 #include <string.h>
+
+#define SETTING_WIFI_ENABLE   "Enable"
+#define SETTING_WIFI_SLOT     "Slot"
+#define SETTING_WIFI_SSID     "ssid"
+#define SETTING_WIFI_PASSWORD "password"
+#define SETTING_WIFI_CHANNEL  "channel"
+#define SETTING_WIFI_MODE     "mode"
+
+#define TRY(x) do { if ((err = (x)) != ESP_OK) { RG_LOGE(#x " = 0x%x\n", err); goto fail; } } while (0)
+
+#ifdef RG_ENABLE_NETWORKING
+#include <esp_idf_version.h>
 #include <esp_err.h>
 #include <esp_log.h>
 #include <esp_event.h>
@@ -15,15 +29,13 @@
 #include <lwip/err.h>
 #include <lwip/sys.h>
 
-#define SETTING_WIFI_ENABLE   "Wifi"
-#define SETTING_WIFI_MODE     "Mode"
-#define SETTING_WIFI_SSID     "SSID"
-#define SETTING_WIFI_PASSWORD "Pass"
-#define SETTING_WIFI_CHANNEL  "Chan"
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 1, 0)
+#define esp_sntp_init sntp_init
+#define esp_sntp_stop sntp_stop
+#define esp_sntp_setoperatingmode sntp_setoperatingmode
+#define esp_sntp_setservername sntp_setservername
+#endif
 
-#define TRY(x) do { if ((err = (x)) != ESP_OK) { RG_LOGE(#x " = 0x%x\n", err); goto fail; } } while (0)
-
-#ifdef RG_ENABLE_NETWORKING
 static rg_wifi_config_t wifi_config;
 static rg_network_state_t network_state = RG_NETWORK_DISABLED;
 static bool wifi_user_started = false;
@@ -287,6 +299,12 @@ bool rg_network_wifi_start(void)
         memcpy(config.sta.ssid, wifi_config.ssid, 32);
         memcpy(config.sta.password, wifi_config.password, 64);
         config.sta.channel = wifi_config.channel;
+        #if defined(RG_GAMEPAD_USE_ESPNOW)
+        if (wifi_config.channel > 0)
+        {
+            rg_input_espnow_notify_channel_switch(wifi_config.channel);
+        }
+        #endif
         TRY(esp_wifi_set_mode(WIFI_MODE_STA));
         TRY(esp_wifi_set_config(WIFI_IF_STA, &config));
         network_state = RG_NETWORK_CONNECTING;
@@ -446,6 +464,14 @@ bool rg_network_init(void)
     network_state = RG_NETWORK_DISCONNECTED;
     wifi_user_started = false;
 
+    // Load the user's chosen config profile, if any
+    int slot = rg_settings_get_number(NS_WIFI, SETTING_WIFI_SLOT, 0);
+    rg_network_wifi_read_config(slot, &wifi_config);
+
+    // Auto-start?
+    if (rg_settings_get_boolean(NS_WIFI, SETTING_WIFI_ENABLE, false))
+        rg_network_wifi_start();
+
     return true;
 fail:
     network_state = RG_NETWORK_DISABLED;
@@ -457,10 +483,18 @@ fail:
 void rg_network_deinit(void)
 {
 #ifdef RG_ENABLE_NETWORKING
+#if defined(RG_GAMEPAD_USE_ESPNOW)
     rg_network_wifi_stop();
     network_state = RG_NETWORK_DISABLED;
     wifi_user_started = false;
-    // We can't really deinit event loops and tcpip adapters...
+#else
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &network_event_handler);
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &network_event_handler);
+    netif = netif_ap = netif_sta = NULL;
+    network_state = RG_NETWORK_DISABLED;
+#endif
 #endif
 }
 
@@ -474,50 +508,77 @@ rg_http_req_t *rg_network_http_open(const char *url, const rg_http_cfg_t *cfg)
         RG_LOGE("Out of memory");
         return NULL;
     }
-    esp_http_client_config_t http_cfg = {
+
+    req->config = cfg ? *cfg : (rg_http_cfg_t)RG_HTTP_DEFAULT_CONFIG();
+    req->client = esp_http_client_init(&(esp_http_client_config_t){
         .url = url,
-        .method = HTTP_METHOD_GET,
-        .timeout_ms = 5000,
-    };
-    if (cfg)
+        .buffer_size = 1024,
+        .buffer_size_tx = 1024,
+        .method = req->config.post_data ? HTTP_METHOD_POST : HTTP_METHOD_GET,
+        .timeout_ms = req->config.timeout_ms,
+    });
+
+    if (!req->client)
     {
-        // TODO: Handle more options
-        if (cfg->post_data)
-            http_cfg.method = HTTP_METHOD_POST;
+        RG_LOGE("Error creating client");
+        goto fail;
     }
-    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
-    if (!client)
+
+try_again:
+    if (esp_http_client_open(req->client, req->config.post_len) != ESP_OK)
     {
-        RG_LOGE("Failed to init http client");
-        free(req);
-        return NULL;
+        RG_LOGE("Error opening connection");
+        goto fail;
     }
-    if (cfg && cfg->post_data)
+
+    if (req->config.post_data)
     {
-        esp_http_client_set_post_field(client, cfg->post_data, strlen(cfg->post_data));
+        esp_http_client_write(req->client, req->config.post_data, req->config.post_len);
+        // Check for errors?
     }
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK)
+
+    if (esp_http_client_fetch_headers(req->client) < 0)
     {
-        RG_LOGE("Failed to open HTTP connection: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        free(req);
-        return NULL;
+        RG_LOGE("Error fetching headers");
+        goto fail;
     }
-    req->client = client;
-    req->status_code = esp_http_client_fetch_headers(client);
-    req->content_length = esp_http_client_get_content_length(client);
+
+    req->status_code = esp_http_client_get_status_code(req->client);
+    req->content_length = esp_http_client_get_content_length(req->client);
+
+    // We must handle redirections manually because we're not using esp_http_client_perform
+    if (req->status_code == 301 || req->status_code == 302)
+    {
+        if (req->redirections < req->config.max_redirections)
+        {
+            esp_http_client_set_redirection(req->client);
+            esp_http_client_close(req->client);
+            req->redirections++;
+            goto try_again;
+        }
+    }
+
     return req;
-#else
-    return NULL;
+
+fail:
+    esp_http_client_cleanup(req->client);
+    free(req);
 #endif
+    return NULL;
 }
 
-int rg_network_http_read(rg_http_req_t *req, void *buffer, size_t length)
+int rg_network_http_read(rg_http_req_t *req, void *buffer, size_t buffer_len)
 {
-    RG_ASSERT_ARG(req != NULL);
+    RG_ASSERT_ARG(req && buffer);
 #ifdef RG_ENABLE_NETWORKING
-    return esp_http_client_read(req->client, buffer, length);
+    // if (req->content_length >= 0 && req->received_bytes >= req->content_length)
+    //     return 0;
+    int len = esp_http_client_read_response(req->client, buffer, buffer_len);
+    if (len > 0)
+        req->received_bytes += len;
+    else
+        esp_http_client_close(req->client);
+    return len;
 #else
     return -1;
 #endif
@@ -526,11 +587,10 @@ int rg_network_http_read(rg_http_req_t *req, void *buffer, size_t length)
 void rg_network_http_close(rg_http_req_t *req)
 {
 #ifdef RG_ENABLE_NETWORKING
-    if (req)
-    {
-        esp_http_client_close(req->client);
-        esp_http_client_cleanup(req->client);
-        free(req);
-    }
+    if (req == NULL)
+        return;
+    esp_http_client_cleanup(req->client);
+    req->client = NULL;
+    free(req);
 #endif
 }

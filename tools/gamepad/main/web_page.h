@@ -736,7 +736,8 @@ static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
 
   function initWebSocket() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/ws`);
+    const host = (location.hostname && location.hostname !== '192.168.4.1') ? '192.168.4.1' : (location.host || '192.168.4.1');
+    ws = new WebSocket(`${proto}//${host}/ws`);
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {

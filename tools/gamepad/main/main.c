@@ -5,6 +5,10 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -18,6 +22,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sleep.h"
+#include "esp_mac.h"
 #include "soc/gpio_reg.h"
 #include "boards.h"
 #include "web_page.h"
@@ -50,8 +55,8 @@ static const char *TAG = "GAMEPAD";
 
 #define GAMEPAD_MAGIC 0x4752 // 'R', 'G'
 
-#define CHANNEL_HOP_INTERVAL_MS  35   // Dwell time per channel during search
-#define CHANNEL_SYNC_TIMEOUT_MS  1200 // Timeout before triggering auto-scan if ACK lost (1.2s)
+#define CHANNEL_HOP_INTERVAL_MS  120  // Dwell time per channel during search (120ms)
+#define CHANNEL_SYNC_TIMEOUT_MS  4000 // Timeout before triggering auto-scan if ACK lost (4.0s)
 
 #define RG_ESPNOW_CMD_ACK          0xFFFF // Normal state ACK / PONG
 #define RG_ESPNOW_CMD_PAIR_REQ     0xFFFE // Gamepad -> Console: Request pairing
@@ -242,8 +247,11 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
     // Console sends back normal ACK
     if (packet->buttons == RG_ESPNOW_CMD_ACK) {
         last_ack_time = now_ms;
-        if (!channel_locked) {
-            channel_locked = true;
+        channel_locked = true;
+        if (packet->channel >= 1 && packet->channel <= 13 && packet->channel != current_channel) {
+            set_gamepad_channel(packet->channel);
+            ESP_LOGI(TAG, "Console sync on Channel %d, switching directly!", current_channel);
+        } else if (!channel_locked) {
             set_gamepad_channel(current_channel);
             ESP_LOGI(TAG, "Console sync acquired on Channel %d!", current_channel);
         }
@@ -367,6 +375,11 @@ static void indicate_player_led(uint8_t player_id)
         gpio_set_level(PIN_LED, 1);
         vTaskDelay(pdMS_TO_TICKS(150));
     }
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+    // ESP32-C3 SuperMini: PIN_LED is shared with PIN_L (GPIO 8). Restore to input with pullup.
+    gpio_set_direction(PIN_LED, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PIN_LED, GPIO_PULLUP_ONLY);
+#endif
 #endif
 }
 
@@ -446,13 +459,13 @@ static esp_err_t ws_handler(httpd_req_t *req)
 static esp_err_t http_get_index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    const char *tag_target = "id=\"playerTag\">PLAYER 1<";
+    const char *tag_target = ">PLAYER 1</button>";
     const char *found = strstr(INDEX_HTML, tag_target);
     if (found && active_player_id == 1) {
-        size_t prefix_len = (found - INDEX_HTML) + strlen("id=\"playerTag\">PLAYER ");
+        size_t prefix_len = (found - INDEX_HTML) + strlen(">PLAYER ");
         httpd_resp_send_chunk(req, INDEX_HTML, prefix_len);
         httpd_resp_send_chunk(req, "2", 1);
-        const char *suffix = found + strlen(tag_target) - 1; // points to '<'
+        const char *suffix = found + strlen(">PLAYER 1");
         httpd_resp_send_chunk(req, suffix, HTTPD_RESP_USE_STRLEN);
         httpd_resp_send_chunk(req, NULL, 0); // End chunked response
         return ESP_OK;
@@ -522,7 +535,9 @@ static void wifi_espnow_init(uint8_t player_id)
             .authmode = WIFI_AUTH_OPEN,
         },
     };
-    snprintf((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), "RetroGo-Pad-P%d", active_player_id + 1);
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), "RetroGo-Pad-%02X%02X", mac[4], mac[5]);
     ap_config.ap.ssid_len = strlen((char *)ap_config.ap.ssid);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
@@ -644,6 +659,7 @@ void app_main(void)
                     set_gamepad_channel(current_channel);
                     last_hop_time = now_ms;
                     last_sent_state = 0xFFFF; // Force probe packet transmission on each channel
+                    last_send_time = 0;       // Transmit probe immediately
                 }
             }
         }

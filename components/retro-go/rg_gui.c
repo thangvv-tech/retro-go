@@ -40,7 +40,7 @@ static struct
 #define SETTING_FONTTYPE    "FontType"
 #define SETTING_CLOCK       "Clock"
 #define SETTING_THEME       "Theme"
-#define SETTING_WIFI_ENABLE "Wifi"
+#define SETTING_WIFI_ENABLE "Enable"
 #define SETTING_WIFI_SLOT   "Slot"
 #define SETTING_LANGUAGE    "Language"
 
@@ -1995,6 +1995,10 @@ static rg_gui_event_t wifi_enable_cb(rg_gui_option_t *option, rg_gui_event_t eve
         rg_input_wait_for_key(RG_KEY_ALL, false, 300);
         wifi_toggle_interactive(enable, slot);
         rg_input_wait_for_key(RG_KEY_ALL, false, 300);
+
+        bool connected = (rg_network_get_info().state > RG_NETWORK_DISCONNECTED);
+        rg_settings_set_boolean(NS_WIFI, SETTING_WIFI_ENABLE, connected);
+        rg_settings_commit();
 
         return RG_DIALOG_REDRAW;
     }

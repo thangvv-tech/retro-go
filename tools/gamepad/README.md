@@ -39,7 +39,7 @@ Supports multiple hardware targets via standard ESP-IDF:
   - All 13 buttons (including MENU) have dedicated pins. No `SELECT + START` combos required on the wireless pad.
 - **Built-in Web Virtual Gamepad (Zero-Hardware Mobile Touch Controller)**:
   - ESP32 simultaneously runs SoftAP + Web Server + WebSocket handler alongside ESP-NOW (`WIFI_MODE_APSTA`).
-  - No physical switches needed to play: Connect phone to Wi-Fi `RetroGo-Pad-P1` and open `http://192.168.4.1`.
+  - No physical switches needed to play: Connect phone to Wi-Fi `RetroGo-Pad-XXXX` (auto Captive Portal pop-up or open `http://192.168.4.1`).
   - Supports true multi-touch, haptic feedback vibration, fullscreen mode, and seamlessly fuses touch buttons with any soldered physical switches (`combined = gpio_buttons | web_buttons`).
 
 ---
