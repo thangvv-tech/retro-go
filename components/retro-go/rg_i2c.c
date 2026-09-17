@@ -269,7 +269,7 @@ bool rg_i2c_gpio_configure_port(int port, uint8_t mask, rg_gpio_mode_t mode)
 
 int rg_i2c_gpio_read_port(int port)
 {
-    if (port < 0 || port >= gpio_ports_count)
+    if (!gpio_initialized || port < 0 || port >= gpio_ports_count)
         return -1;
 #if RG_I2C_GPIO_DRIVER == 4 || RG_I2C_GPIO_DRIVER == 5 // PCF8575/PCF8574
     uint8_t values[gpio_ports_count];

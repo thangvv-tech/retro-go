@@ -1,5 +1,6 @@
 #include "rg_system.h"
 #include "rg_network.h"
+#include "rg_input.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,17 @@ static void network_event_handler(void* arg, esp_event_base_t event_base, int32_
                 esp_wifi_connect();
             }
         }
+        else if (event_id == WIFI_EVENT_STA_CONNECTED)
+        {
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            #if defined(RG_GAMEPAD_USE_ESPNOW)
+            wifi_event_sta_connected_t *event = (wifi_event_sta_connected_t *)event_data;
+            if (event && event->channel > 0)
+            {
+                rg_input_espnow_notify_channel_switch(event->channel);
+            }
+            #endif
+        }
         else if (event_id == WIFI_EVENT_STA_DISCONNECTED)
         {
             wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
@@ -102,6 +114,15 @@ static void network_event_handler(void* arg, esp_event_base_t event_base, int32_
         if (event_id == IP_EVENT_STA_GOT_IP)
         {
             wifi_retry_count = 0;
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            #if defined(RG_GAMEPAD_USE_ESPNOW)
+            uint8_t primary = 0;
+            wifi_second_chan_t second;
+            if (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary > 0)
+            {
+                rg_input_espnow_notify_channel_switch(primary);
+            }
+            #endif
             if (wifi_user_started)
             {
                 network_state = RG_NETWORK_CONNECTED;
@@ -240,7 +261,11 @@ bool rg_network_wifi_start(void)
         config.ap.authmode = wifi_config.password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
         config.ap.channel = wifi_config.channel ?: 1;
         config.ap.max_connection = 1;
+        #if defined(RG_GAMEPAD_USE_ESPNOW)
+        TRY(esp_wifi_set_mode(WIFI_MODE_APSTA));
+        #else
         TRY(esp_wifi_set_mode(WIFI_MODE_AP));
+        #endif
         TRY(esp_wifi_set_config(WIFI_IF_AP, &config));
         err = esp_wifi_start();
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
@@ -248,6 +273,13 @@ bool rg_network_wifi_start(void)
             RG_LOGE("esp_wifi_start = 0x%x\n", err);
             goto fail;
         }
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        #if defined(RG_GAMEPAD_USE_ESPNOW)
+        if (config.ap.channel > 0)
+        {
+            rg_input_espnow_notify_channel_switch(config.ap.channel);
+        }
+        #endif
     }
     else
     {
@@ -265,6 +297,7 @@ bool rg_network_wifi_start(void)
             RG_LOGE("esp_wifi_start = 0x%x\n", err);
             goto fail;
         }
+        esp_wifi_set_ps(WIFI_PS_NONE);
         RG_LOGI("Connecting to '%s' (channel: %d)...", wifi_config.ssid, wifi_config.channel);
         esp_wifi_connect();
     }
@@ -283,6 +316,9 @@ void rg_network_wifi_stop(void)
         return;
     network_state = RG_NETWORK_DISCONNECTED;
     #if defined(RG_GAMEPAD_USE_ESPNOW)
+    // Proactively notify gamepad to return to channel 1 before console switches channel
+    rg_input_espnow_notify_channel_switch(1);
+    vTaskDelay(pdMS_TO_TICKS(10));
     esp_wifi_disconnect();
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_promiscuous(true);
@@ -292,6 +328,7 @@ void rg_network_wifi_stop(void)
     #else
     esp_wifi_stop();
     #endif
+    memset(&wifi_config, 0, sizeof(wifi_config));
     netif = NULL;
     rg_system_event(RG_EVENT_NETWORK_DISCONNECTED, NULL);
     RG_LOGI("Wifi stopped.");
@@ -395,7 +432,12 @@ bool rg_network_init(void)
         RG_LOGE("esp_wifi_init = 0x%x\n", err);
         goto fail;
     }
-    TRY(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        RG_LOGE("esp_wifi_set_storage = 0x%x\n", err);
+        goto fail;
+    }
 
     // Setup SNTP client but don't query it yet
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);

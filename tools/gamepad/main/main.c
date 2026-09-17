@@ -1,7 +1,7 @@
-// Multi-Target Ultra-Low-Latency Wireless Gamepad for Retro-Go (ESP-NOW)
+// Multi-Target Ultra-Low-Latency Wireless Gamepad for Retro-Go (ESP-NOW + Web Controller)
 // Pure ESP-IDF application (ESP-IDF v4.4 / v5.x)
 // Supports ESP32-C3, ESP32-S3, ESP32 Classic
-// Auto Channel Hopping / Synchronization support
+// Auto Channel Hopping & Proactive Channel Handover with Explicit Bonded Pairing
 
 #include <stdio.h>
 #include <string.h>
@@ -12,12 +12,15 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "esp_now.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "soc/gpio_reg.h"
 #include "boards.h"
+#include "web_page.h"
 
 static const char *TAG = "GAMEPAD";
 
@@ -47,15 +50,23 @@ static const char *TAG = "GAMEPAD";
 
 #define GAMEPAD_MAGIC 0x4752 // 'R', 'G'
 
-#define CHANNEL_HOP_INTERVAL_MS  15   // Dwell time per channel during search
-#define CHANNEL_SYNC_TIMEOUT_MS  600  // Timeout before triggering auto-scan if ACK lost
+#define CHANNEL_HOP_INTERVAL_MS  35   // Dwell time per channel during search
+#define CHANNEL_SYNC_TIMEOUT_MS  1200 // Timeout before triggering auto-scan if ACK lost (1.2s)
+
+#define RG_ESPNOW_CMD_ACK          0xFFFF // Normal state ACK / PONG
+#define RG_ESPNOW_CMD_PAIR_REQ     0xFFFE // Gamepad -> Console: Request pairing
+#define RG_ESPNOW_CMD_PAIR_ACK     0xFFFD // Console -> Gamepad: Confirm pairing
+#define RG_ESPNOW_CMD_CHAN_SWITCH  0xFFFC // Console -> Gamepad: Switch channel immediately
 
 typedef struct __attribute__((packed)) {
-    uint16_t magic;      // Magic identifier (0x4752)
-    uint16_t system_id;  // System/Console ID (0 = all, >0 = isolated room/console)
-    uint16_t buttons;    // Bitmask RG_KEY_* (0xFFFF = ACK / PONG)
-    uint8_t  seq;        // Packet sequence number (0-255)
-    uint8_t  player_id;  // 0 = Player 1, 1 = Player 2
+    uint16_t magic;          // Magic identifier (0x4752)
+    uint16_t system_id;      // System/Console ID (0 = all, >0 = isolated room/console)
+    uint16_t buttons;        // Bitmask RG_KEY_* or RG_ESPNOW_CMD_*
+    uint8_t  seq;            // Packet sequence number (0-255)
+    uint8_t  player_id;      // 0 = Player 1, 1 = Player 2
+    uint8_t  console_mac[6]; // Paired Console STA MAC (all 0 if unpaired)
+    uint8_t  channel;        // Primary channel hint
+    uint8_t  reserved;       // Alignment padding
 } gamepad_packet_t;
 
 typedef struct {
@@ -83,19 +94,117 @@ static const button_map_t BUTTONS[] = {
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static uint8_t packet_seq = 0;
+static uint8_t active_player_id = 0;
 
+// Pairing & MAC Whitelist State
+static uint8_t paired_console_mac[6] = {0};
+static bool is_paired = false;
+
+// Channel sync state
 static volatile int64_t last_ack_time = 0;
+static volatile int64_t last_hop_time = 0;
 static volatile bool channel_locked = false;
 static uint8_t current_channel = CONFIG_GAMEPAD_WIFI_CHANNEL;
 static uint8_t saved_channel = CONFIG_GAMEPAD_WIFI_CHANNEL;
-static uint8_t active_player_id = 0;
+static int64_t stable_channel_since = 0;
+
+// Web virtual gamepad state
+static volatile uint16_t web_buttons = 0;
+static int64_t web_last_activity = 0;
+
+static void save_bonding_to_nvs(const uint8_t *mac)
+{
+    nvs_handle_t handle;
+    if (nvs_open("gamepad", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_blob(handle, "console_mac", mac, 6);
+        nvs_commit(handle);
+        nvs_close(handle);
+        memcpy(paired_console_mac, mac, 6);
+        is_paired = true;
+    }
+}
+
+static bool load_bonding_from_nvs(void)
+{
+    nvs_handle_t handle;
+    size_t len = 6;
+    bool ok = false;
+    if (nvs_open("gamepad", NVS_READONLY, &handle) == ESP_OK) {
+        if (nvs_get_blob(handle, "console_mac", paired_console_mac, &len) == ESP_OK && len == 6) {
+            uint8_t zero_mac[6] = {0};
+            if (memcmp(paired_console_mac, zero_mac, 6) != 0) {
+                ok = true;
+            }
+        }
+        nvs_close(handle);
+    }
+    return ok;
+}
+
+static void clear_bonding_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open("gamepad", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_erase_key(handle, "console_mac");
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+    memset(paired_console_mac, 0, 6);
+    is_paired = false;
+}
+
+static void save_channel_to_nvs(uint8_t ch)
+{
+    if (ch == saved_channel || ch < 1 || ch > 13)
+        return; // Skip redundant writes
+    nvs_handle_t handle;
+    if (nvs_open("gamepad", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u8(handle, "wifi_chan", ch);
+        nvs_commit(handle);
+        nvs_close(handle);
+        saved_channel = ch;
+    }
+}
+
+static uint8_t load_channel_from_nvs(void)
+{
+    nvs_handle_t handle;
+    uint8_t ch = CONFIG_GAMEPAD_WIFI_CHANNEL;
+    if (nvs_open("gamepad", NVS_READONLY, &handle) == ESP_OK) {
+        if (nvs_get_u8(handle, "wifi_chan", &ch) != ESP_OK || ch < 1 || ch > 13) {
+            ch = CONFIG_GAMEPAD_WIFI_CHANNEL;
+        }
+        nvs_close(handle);
+    }
+    return ch;
+}
+
+static void set_gamepad_channel(uint8_t ch)
+{
+    if (ch < 1 || ch > 13)
+        return;
+    current_channel = ch;
+
+    wifi_config_t ap_config;
+    if (esp_wifi_get_config(WIFI_IF_AP, &ap_config) == ESP_OK) {
+        if (ap_config.ap.channel != ch) {
+            ap_config.ap.channel = ch;
+            esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+        }
+    }
+    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+}
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 static void espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len)
+{
+    const uint8_t *src_mac = esp_now_info->src_addr;
+    (void)src_mac;
 #else
 static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data_len)
-#endif
 {
+    (void)src_mac;
+#endif
     if (data_len < (int)sizeof(gamepad_packet_t))
         return;
 
@@ -108,10 +217,45 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
         return;
 #endif
 
-    // Console sends back an ACK with buttons == 0xFFFF
-    if (packet->buttons == 0xFFFF) {
-        last_ack_time = esp_timer_get_time() / 1000;
+    int64_t now_ms = esp_timer_get_time() / 1000;
+
+    // Handle pairing confirmation from console
+    if (packet->buttons == RG_ESPNOW_CMD_PAIR_ACK) {
+        save_bonding_to_nvs(packet->console_mac);
+        last_ack_time = now_ms;
         channel_locked = true;
+        uint8_t ch = (packet->channel >= 1 && packet->channel <= 13) ? packet->channel : current_channel;
+        set_gamepad_channel(ch);
+        ESP_LOGI(TAG, "Bonded successfully with Console %02X:%02X:%02X:%02X:%02X:%02X on Channel %d",
+                 packet->console_mac[0], packet->console_mac[1], packet->console_mac[2],
+                 packet->console_mac[3], packet->console_mac[4], packet->console_mac[5], current_channel);
+        return;
+    }
+
+    // For normal ACKs and CHAN_SWITCH, verify console MAC if paired
+    if (is_paired) {
+        if (memcmp(packet->console_mac, paired_console_mac, 6) != 0) {
+            return; // Ignore responses from non-paired console
+        }
+    }
+
+    // Console sends back normal ACK
+    if (packet->buttons == RG_ESPNOW_CMD_ACK) {
+        last_ack_time = now_ms;
+        if (!channel_locked) {
+            channel_locked = true;
+            set_gamepad_channel(current_channel);
+            ESP_LOGI(TAG, "Console sync acquired on Channel %d!", current_channel);
+        }
+    }
+    // Proactive channel switch command from paired console
+    else if (packet->buttons == RG_ESPNOW_CMD_CHAN_SWITCH) {
+        last_ack_time = now_ms;
+        channel_locked = true;
+        if (packet->channel >= 1 && packet->channel <= 13 && packet->channel != current_channel) {
+            set_gamepad_channel(packet->channel);
+            ESP_LOGI(TAG, "Proactively switched to Channel %d instructed by Console.", current_channel);
+        }
     }
 }
 
@@ -136,76 +280,6 @@ static void buttons_init(void)
         gpio_wakeup_enable(BUTTONS[i].pin, GPIO_INTR_LOW_LEVEL);
     }
     esp_sleep_enable_gpio_wakeup();
-}
-
-static void save_channel_to_nvs(uint8_t ch)
-{
-    nvs_handle_t handle;
-    if (nvs_open("gamepad", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_set_u8(handle, "wifi_chan", ch);
-        nvs_commit(handle);
-        nvs_close(handle);
-        saved_channel = ch;
-    }
-}
-
-static uint8_t load_channel_from_nvs(void)
-{
-    nvs_handle_t handle;
-    uint8_t ch = CONFIG_GAMEPAD_WIFI_CHANNEL;
-    if (nvs_open("gamepad", NVS_READONLY, &handle) == ESP_OK) {
-        if (nvs_get_u8(handle, "wifi_chan", &ch) != ESP_OK || ch < 1 || ch > 13) {
-            ch = CONFIG_GAMEPAD_WIFI_CHANNEL;
-        }
-        nvs_close(handle);
-    }
-    return ch;
-}
-
-static void wifi_espnow_init(void)
-{
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    current_channel = load_channel_from_nvs();
-    saved_channel = current_channel;
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    // Initial WiFi channel
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-    ESP_ERROR_CHECK(esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(false));
-
-    // Maximize transmission power (19.5 dBm) for maximum link margin
-    esp_wifi_set_max_tx_power(78);
-
-    ESP_ERROR_CHECK(esp_now_init());
-
-    // High-speed 24Mbps OFDM PHY rate reduces packet airtime to ~40us (7.5x faster than 1Mbps CCK)
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
-
-    esp_now_peer_info_t peer_info = {0};
-    memcpy(peer_info.peer_addr, BROADCAST_MAC, 6);
-    peer_info.channel = 0; // Follow current WiFi channel
-    peer_info.ifidx = WIFI_IF_STA;
-    peer_info.encrypt = false;
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
-
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
-
-    ESP_LOGI(TAG, "ESP-NOW Gamepad ready on %s. Channel %d (Auto-Scan enabled).", BOARD_TARGET_NAME, current_channel);
 }
 
 // Ultra-fast GPIO read using hardware register (1 CPU cycle for all GPIOs)
@@ -245,6 +319,13 @@ static uint8_t init_player_id(void)
         // Allow pull-up stabilization and user button hold to register reliably
         vTaskDelay(pdMS_TO_TICKS(20));
         uint16_t boot_keys = read_buttons_raw();
+
+        // Boot combo: SELECT + START held together clears bonding bond
+        if ((boot_keys & (RG_KEY_SELECT | RG_KEY_START)) == (RG_KEY_SELECT | RG_KEY_START)) {
+            clear_bonding_nvs();
+            ESP_LOGW(TAG, "Pairing bond cleared! Entering discovery pairing mode.");
+        }
+
         if (boot_keys & RG_KEY_B) {
             id = 1; // Button B held at boot -> Player 2
             nvs_set_u8(handle, "player_id", id);
@@ -263,9 +344,9 @@ static uint8_t init_player_id(void)
         }
         nvs_close(handle);
 
-        if (boot_keys & (RG_KEY_A | RG_KEY_B)) {
+        if (boot_keys & (RG_KEY_A | RG_KEY_B | RG_KEY_SELECT | RG_KEY_START)) {
             int wait_count = 0;
-            while ((read_buttons_raw() & (RG_KEY_A | RG_KEY_B)) && wait_count++ < 200) {
+            while ((read_buttons_raw() & (RG_KEY_A | RG_KEY_B | RG_KEY_SELECT | RG_KEY_START)) && wait_count++ < 200) {
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
         }
@@ -289,20 +370,205 @@ static void indicate_player_led(uint8_t player_id)
 #endif
 }
 
+// -----------------------------------------------------------------------------
+// Web UI & WebSocket Server
+// -----------------------------------------------------------------------------
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        ESP_LOGI(TAG, "Web client connected to WebSocket");
+        web_last_activity = esp_timer_get_time();
+        return ESP_OK;
+    }
+
+    httpd_ws_frame_t ws_pkt;
+    uint8_t buf[16];
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+    ws_pkt.payload = buf;
+
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, sizeof(buf));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (ws_pkt.len >= 2) {
+        if (buf[0] == 0xAA) {
+            // Control Command from Web UI
+            if (buf[1] == 0x01 && ws_pkt.len >= 3) {
+                // Switch Player ID
+                uint8_t new_id = buf[2] & 1;
+                if (new_id != active_player_id) {
+                    active_player_id = new_id;
+                    nvs_handle_t h;
+                    if (nvs_open("gamepad", NVS_READWRITE, &h) == ESP_OK) {
+                        nvs_set_u8(h, "player_id", active_player_id);
+                        nvs_commit(h);
+                        nvs_close(h);
+                    }
+                    indicate_player_led(active_player_id);
+                    ESP_LOGI(TAG, "Web switched Active Player ID to %d", active_player_id + 1);
+                }
+            } else if (buf[1] == 0x02) {
+                // Trigger Re-Pairing
+                clear_bonding_nvs();
+                channel_locked = false;
+                set_gamepad_channel(current_channel);
+                last_hop_time = esp_timer_get_time() / 1000;
+                ESP_LOGI(TAG, "Web triggered Re-Pairing mode!");
+            }
+        } else {
+            web_buttons = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+            web_last_activity = esp_timer_get_time();
+        }
+
+        // Send status telemetry back to Web client
+        uint8_t status_buf[6] = {
+            0xBB,
+            is_paired ? 1 : 0,
+            active_player_id,
+            current_channel,
+            channel_locked ? 1 : 0,
+            0
+        };
+        httpd_ws_frame_t resp_pkt = {
+            .final = true,
+            .fragmented = false,
+            .type = HTTPD_WS_TYPE_BINARY,
+            .payload = status_buf,
+            .len = sizeof(status_buf),
+        };
+        httpd_ws_send_frame(req, &resp_pkt);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t http_get_index_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    const char *tag_target = "id=\"playerTag\">PLAYER 1<";
+    const char *found = strstr(INDEX_HTML, tag_target);
+    if (found && active_player_id == 1) {
+        size_t prefix_len = (found - INDEX_HTML) + strlen("id=\"playerTag\">PLAYER ");
+        httpd_resp_send_chunk(req, INDEX_HTML, prefix_len);
+        httpd_resp_send_chunk(req, "2", 1);
+        const char *suffix = found + strlen(tag_target) - 1; // points to '<'
+        httpd_resp_send_chunk(req, suffix, HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send_chunk(req, NULL, 0); // End chunked response
+        return ESP_OK;
+    }
+    httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_open_sockets = 4;
+    config.lru_purge_enable = true;
+
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t index_uri = {
+            .uri       = "/",
+            .method    = HTTP_GET,
+            .handler   = http_get_index_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &index_uri);
+
+        httpd_uri_t ws_uri = {
+            .uri          = "/ws",
+            .method       = HTTP_GET,
+            .handler      = ws_handler,
+            .user_ctx     = NULL,
+            .is_websocket = true
+        };
+        httpd_register_uri_handler(server, &ws_uri);
+
+        ESP_LOGI(TAG, "Web Gamepad UI started on http://192.168.4.1");
+    }
+    return server;
+}
+
+static void wifi_espnow_init(uint8_t player_id)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    is_paired = load_bonding_from_nvs();
+    current_channel = load_channel_from_nvs();
+    saved_channel = current_channel;
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    wifi_config_t ap_config = {
+        .ap = {
+            .channel = current_channel,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN,
+        },
+    };
+    snprintf((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), "RetroGo-Pad-P%d", active_player_id + 1);
+    ap_config.ap.ssid_len = strlen((char *)ap_config.ap.ssid);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    set_gamepad_channel(current_channel);
+
+    // Continuous reception without modem sleep drops
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    // Maximize transmission power (19.5 dBm) for solid link margin
+    esp_wifi_set_max_tx_power(78);
+
+    ESP_ERROR_CHECK(esp_now_init());
+
+    // High-speed 24Mbps OFDM PHY rate reduces packet airtime to ~40us
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
+
+    esp_now_peer_info_t peer_info = {0};
+    memcpy(peer_info.peer_addr, BROADCAST_MAC, 6);
+    peer_info.channel = 0; // 0 = follow interface channel dynamically
+    peer_info.ifidx = WIFI_IF_STA;
+    peer_info.encrypt = false;
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+
+    ESP_LOGI(TAG, "ESP-NOW Gamepad TX ready on Channel %d (Player %d). Paired: %s",
+             current_channel, active_player_id + 1, is_paired ? "YES" : "NO (Discovery Mode)");
+}
+
 void app_main(void)
 {
-    wifi_espnow_init();
     buttons_init();
 
     uint8_t player_id = init_player_id();
     indicate_player_led(player_id);
     buttons_init(); // Re-arm GPIO as input with pull-up
 
-    uint16_t debounced_state = 0;
+    wifi_espnow_init(active_player_id);
+    start_webserver();
+
+    uint16_t debounced_gpio_state = 0;
     uint16_t last_sample = 0;
     uint16_t last_sent_state = 0xFFFF; // Force initial packet send
     int64_t last_send_time = 0;
-    int64_t last_hop_time = 0;
     int64_t last_activity_time = esp_timer_get_time() / 1000;
 
     gamepad_packet_t packet = {
@@ -310,89 +576,132 @@ void app_main(void)
         .system_id = GAMEPAD_SYSTEM_ID,
         .buttons = 0,
         .seq = 0,
-        .player_id = player_id,
+        .player_id = active_player_id,
+        .channel = current_channel,
+        .reserved = 0,
     };
+    memcpy(packet.console_mac, paired_console_mac, 6);
 
     while (1) {
-        // 1. Single-cycle hardware register read
+        int64_t now_us = esp_timer_get_time();
+        int64_t now_ms = now_us / 1000;
+
+        // 1. Single-cycle hardware register read for physical buttons
         uint16_t current_sample = read_buttons_raw();
 
         // 2. Asymmetric debounce: 0ms instant trigger on press, 2-sample filter on release
-        uint16_t newly_pressed = current_sample & ~debounced_state;
+        uint16_t newly_pressed = current_sample & ~debounced_gpio_state;
         if (newly_pressed) {
-            debounced_state |= newly_pressed;
+            debounced_gpio_state |= newly_pressed;
         }
-        uint16_t candidate_release = debounced_state & ~current_sample;
+        uint16_t candidate_release = debounced_gpio_state & ~current_sample;
         if (candidate_release) {
-            // Only clear bit if released across 2 consecutive samples (filters contact bounce)
-            debounced_state &= ~(candidate_release & ~last_sample);
+            debounced_gpio_state &= ~(candidate_release & ~last_sample);
         }
         last_sample = current_sample;
 
-        int64_t now = esp_timer_get_time() / 1000; // ms
-
-        // Track activity for sleep timeout
-        if (debounced_state != 0) {
-            last_activity_time = now;
+        // 3. Safety Watchdog: clear web buttons if client disconnected or idle > 1.5s
+        if (web_buttons != 0 && (now_us - web_last_activity > 1500000)) {
+            web_buttons = 0;
         }
 
-        // 3. Auto Channel Hopping & Sync State Machine
-        if (channel_locked) {
-            // Check if connection timed out (Console switched WiFi / shut down)
-            if (now - last_ack_time > CHANNEL_SYNC_TIMEOUT_MS) {
-                channel_locked = false;
-                last_hop_time = now;
-                ESP_LOGW(TAG, "Console sync lost. Scanning channels (1..13)...");
+        // 4. Merge Physical GPIO buttons + Web Virtual buttons seamlessly!
+        uint16_t current_buttons = debounced_gpio_state | web_buttons;
+
+        // Track activity for sleep timeout (physical buttons or web activity)
+        if (current_buttons != 0 || (now_us - web_last_activity < 60000000LL)) {
+            last_activity_time = now_ms;
+        }
+
+        // 5. Pairing & Auto Channel Hopping State Machine
+        if (!is_paired) {
+            // Unpaired: Hop every CHANNEL_HOP_INTERVAL_MS and transmit PAIR_REQ
+            if (now_ms - last_hop_time >= CHANNEL_HOP_INTERVAL_MS) {
+                current_channel = (current_channel % 13) + 1; // 1..13
+                set_gamepad_channel(current_channel);
+                last_hop_time = now_ms;
+
+                packet.buttons = RG_ESPNOW_CMD_PAIR_REQ;
+                packet.seq = packet_seq++;
+                packet.player_id = active_player_id;
+                packet.channel = current_channel;
+                memset(packet.console_mac, 0, 6);
+                esp_now_send(BROADCAST_MAC, (const uint8_t *)&packet, sizeof(packet));
             }
         } else {
-            // Searching channels: Hop every CHANNEL_HOP_INTERVAL_MS until ACK received
-            if (now - last_hop_time >= CHANNEL_HOP_INTERVAL_MS) {
-                current_channel = (current_channel % 13) + 1; // 1 -> 2 -> ... -> 13 -> 1
-                esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
-                last_hop_time = now;
-                last_sent_state = 0xFFFF; // Force probe packet transmission on each channel
+            if (channel_locked) {
+                // Check if connection timed out (Console switched WiFi / shut down)
+                if (now_ms - last_ack_time > CHANNEL_SYNC_TIMEOUT_MS) {
+                    channel_locked = false;
+                    last_hop_time = now_ms;
+                    set_gamepad_channel(current_channel);
+                    ESP_LOGW(TAG, "Console sync lost. Scanning channels (1..13)...");
+                }
+            } else {
+                // Searching channels: Hop every CHANNEL_HOP_INTERVAL_MS until ACK received
+                if (now_ms - last_hop_time >= CHANNEL_HOP_INTERVAL_MS) {
+                    current_channel = (current_channel % 13) + 1;
+                    set_gamepad_channel(current_channel);
+                    last_hop_time = now_ms;
+                    last_sent_state = 0xFFFF; // Force probe packet transmission on each channel
+                }
             }
         }
 
-        // If newly locked to a new channel, save to NVS
-        if (channel_locked && current_channel != saved_channel) {
-            save_channel_to_nvs(current_channel);
-            ESP_LOGI(TAG, "Locked to Console on Channel %d (saved to NVS).", current_channel);
+        // 6. Flash wear-out protection: Debounce NVS commit by requiring 3 seconds continuous channel stability
+        if (channel_locked) {
+            if (current_channel != saved_channel) {
+                if (stable_channel_since == 0) {
+                    stable_channel_since = now_ms;
+                } else if (now_ms - stable_channel_since >= 3000) {
+                    save_channel_to_nvs(current_channel);
+                    ESP_LOGI(TAG, "Locked to Console on Channel %d (saved to NVS after 3s stability).", current_channel);
+                    stable_channel_since = 0;
+                }
+            } else {
+                stable_channel_since = 0;
+            }
+        } else {
+            stable_channel_since = 0;
         }
 
-        // 4. Transmit immediately on state change, or periodically on heartbeat interval
-        bool state_changed = (debounced_state != last_sent_state);
-        bool heartbeat_due = (now - last_send_time >= HEARTBEAT_INTERVAL_MS);
+        // 7. Transmit immediately on state change, or periodically on heartbeat interval
+        if (is_paired) {
+            bool state_changed = (current_buttons != last_sent_state);
+            bool heartbeat_due = (now_ms - last_send_time >= HEARTBEAT_INTERVAL_MS);
 
-        if (state_changed || heartbeat_due) {
-            packet.buttons = debounced_state;
-            packet.seq = packet_seq++;
-            packet.player_id = player_id;
+            if (state_changed || heartbeat_due) {
+                packet.buttons = current_buttons;
+                packet.seq = packet_seq++;
+                packet.player_id = active_player_id;
+                packet.channel = current_channel;
+                memcpy(packet.console_mac, paired_console_mac, 6);
 
-            esp_now_send(BROADCAST_MAC, (const uint8_t *)&packet, sizeof(packet));
+                esp_now_send(BROADCAST_MAC, (const uint8_t *)&packet, sizeof(packet));
 
-            last_sent_state = debounced_state;
-            last_send_time = now;
+                last_sent_state = current_buttons;
+                last_send_time = now_ms;
+            }
         }
 
-        // 5. Power management: Enter light-sleep if idle for 60 seconds
-        if (debounced_state == 0 && (now - last_activity_time > LIGHT_SLEEP_TIMEOUT_MS)) {
+        // 8. Power management: Enter light-sleep if idle for 60 seconds
+        if (current_buttons == 0 && (now_ms - last_activity_time > LIGHT_SLEEP_TIMEOUT_MS)) {
             ESP_LOGI(TAG, "Entering light-sleep mode (idle). Press any button to wake up.");
-            // Send clear state before sleeping
-            packet.buttons = 0;
-            packet.seq = packet_seq++;
-            packet.player_id = player_id;
-            esp_now_send(BROADCAST_MAC, (const uint8_t *)&packet, sizeof(packet));
+            if (is_paired) {
+                packet.buttons = 0;
+                packet.seq = packet_seq++;
+                packet.player_id = active_player_id;
+                packet.channel = current_channel;
+                memcpy(packet.console_mac, paired_console_mac, 6);
+                esp_now_send(BROADCAST_MAC, (const uint8_t *)&packet, sizeof(packet));
+            }
 
-            // Flush WiFi buffers
             vTaskDelay(pdMS_TO_TICKS(10));
-
-            // Sleep until any button GPIO is pulled LOW
             esp_light_sleep_start();
 
-            // Woke up on button press
-            now = esp_timer_get_time() / 1000;
-            last_activity_time = now;
+            now_ms = esp_timer_get_time() / 1000;
+            last_activity_time = now_ms;
+            web_last_activity = esp_timer_get_time();
             last_sent_state = 0xFFFF; // Force instant transmission on wake
             ESP_LOGI(TAG, "Woke up from light sleep.");
         }

@@ -40,7 +40,7 @@ static struct
 #define SETTING_FONTTYPE    "FontType"
 #define SETTING_CLOCK       "Clock"
 #define SETTING_THEME       "Theme"
-#define SETTING_WIFI_ENABLE "Enable"
+#define SETTING_WIFI_ENABLE "Wifi"
 #define SETTING_WIFI_SLOT   "Slot"
 #define SETTING_LANGUAGE    "Language"
 
@@ -1760,7 +1760,7 @@ static rg_gui_event_t border_update_cb(rg_gui_option_t *option, rg_gui_event_t e
 static void wifi_toggle_interactive(bool enable, int slot)
 {
     rg_network_state_t target_state = enable ? RG_NETWORK_CONNECTED : RG_NETWORK_DISCONNECTED;
-    int64_t timeout = rg_system_timer() + 10 * 1000000;
+    int64_t timeout = rg_system_timer() + (enable ? 10 * 1000000 : 2 * 1000000);
     rg_gui_draw_message(enable ? _("Connecting...") : _("Disconnecting..."));
     rg_network_wifi_stop();
     if (enable)
@@ -1781,14 +1781,19 @@ static void wifi_toggle_interactive(bool enable, int slot)
         if (!rg_network_wifi_start())
             return;
     }
-    do // Always loop at least once, in case we're in a transition
+    // Wait for initial button release to prevent premature cancel/bounce
+    rg_input_wait_for_key(RG_KEY_ALL, false, 300);
+    do
     {
         rg_task_delay(100);
         if (rg_system_timer() > timeout)
             break;
-        if (rg_input_read_gamepad())
+        // Only cancel keys (B, MENU, OPTION) can abort wait dialog
+        if (rg_input_read_gamepad() & (RG_KEY_B | RG_KEY_MENU | RG_KEY_OPTION))
             break;
     } while (rg_network_get_info().state != target_state);
+    // Flush key inputs before returning to dialog to avoid double toggle
+    rg_input_wait_for_key(RG_KEY_ALL, false, 300);
 }
 
 static rg_gui_event_t wifi_status_cb(rg_gui_option_t *option, rg_gui_event_t event)
@@ -1969,14 +1974,28 @@ static rg_gui_event_t wifi_enable_cb(rg_gui_option_t *option, rg_gui_event_t eve
 
     if (event == RG_DIALOG_PREV || event == RG_DIALOG_NEXT || event == RG_DIALOG_ENTER)
     {
-        bool enable = !is_running;
+        bool enable;
+        if (event == RG_DIALOG_PREV)
+            enable = false;
+        else if (event == RG_DIALOG_NEXT)
+            enable = true;
+        else
+            enable = !is_running;
+
+        if (enable == is_running)
+            return RG_DIALOG_VOID;
+
         int slot = rg_settings_get_number(NS_WIFI, SETTING_WIFI_SLOT, 0);
         if (slot < 0)
             slot = 0;
         rg_settings_set_boolean(NS_WIFI, SETTING_WIFI_ENABLE, enable);
         rg_settings_set_number(NS_WIFI, SETTING_WIFI_SLOT, slot);
         rg_settings_commit();
+
+        rg_input_wait_for_key(RG_KEY_ALL, false, 300);
         wifi_toggle_interactive(enable, slot);
+        rg_input_wait_for_key(RG_KEY_ALL, false, 300);
+
         return RG_DIALOG_REDRAW;
     }
     strcpy(option->value, is_running ? _("On") : _("Off"));
