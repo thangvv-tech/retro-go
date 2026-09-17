@@ -100,4 +100,9 @@ bool rg_input_read_battery_raw(rg_battery_t *out);
 const char *rg_input_get_key_name(rg_key_t key);
 #if defined(RG_GAMEPAD_USE_ESPNOW)
 void rg_input_espnow_notify_channel_switch(uint8_t new_channel);
+bool rg_input_espnow_is_bonded(void);
+bool rg_input_espnow_is_connected(void);
+const uint8_t *rg_input_espnow_get_bonded_mac(void);
+void rg_input_espnow_unpair(void);
+void rg_input_espnow_start_pairing(int timeout_ms);
 #endif

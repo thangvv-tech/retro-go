@@ -39,7 +39,7 @@ static const char *TAG = "GAMEPAD";
 #endif
 
 #ifndef CONFIG_GAMEPAD_POLL_INTERVAL_MS
-#define CONFIG_GAMEPAD_POLL_INTERVAL_MS 3
+#define CONFIG_GAMEPAD_POLL_INTERVAL_MS 1
 #endif
 #define POLL_INTERVAL_MS CONFIG_GAMEPAD_POLL_INTERVAL_MS
 
@@ -56,12 +56,13 @@ static const char *TAG = "GAMEPAD";
 #define GAMEPAD_MAGIC 0x4752 // 'R', 'G'
 
 #define CHANNEL_HOP_INTERVAL_MS  120  // Dwell time per channel during search (120ms)
-#define CHANNEL_SYNC_TIMEOUT_MS  4000 // Timeout before triggering auto-scan if ACK lost (4.0s)
+#define CHANNEL_SYNC_TIMEOUT_MS  1200 // Timeout before triggering auto-scan if ACK lost (1.2s)
 
 #define RG_ESPNOW_CMD_ACK          0xFFFF // Normal state ACK / PONG
 #define RG_ESPNOW_CMD_PAIR_REQ     0xFFFE // Gamepad -> Console: Request pairing
 #define RG_ESPNOW_CMD_PAIR_ACK     0xFFFD // Console -> Gamepad: Confirm pairing
 #define RG_ESPNOW_CMD_CHAN_SWITCH  0xFFFC // Console -> Gamepad: Switch channel immediately
+#define RG_ESPNOW_CMD_UNPAIR       0xFFFB // Console -> Gamepad: Unpair command
 
 typedef struct __attribute__((packed)) {
     uint16_t magic;          // Magic identifier (0x4752)
@@ -113,16 +114,25 @@ static uint8_t current_channel = CONFIG_GAMEPAD_WIFI_CHANNEL;
 static uint8_t saved_channel = CONFIG_GAMEPAD_WIFI_CHANNEL;
 static int64_t stable_channel_since = 0;
 
-// Web virtual gamepad state
+// Web virtual gamepad state (always enabled as requested)
+static bool web_controller_enabled = true;
 static volatile uint16_t web_buttons = 0;
 static int64_t web_last_activity = 0;
 
 static void save_bonding_to_nvs(const uint8_t *mac)
 {
+    if (is_paired && memcmp(paired_console_mac, mac, 6) == 0)
+        return;
+
     nvs_handle_t handle;
     if (nvs_open("gamepad", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_set_blob(handle, "console_mac", mac, 6);
-        nvs_commit(handle);
+        uint8_t cur_mac[6];
+        size_t len = sizeof(cur_mac);
+        if (nvs_get_blob(handle, "console_mac", cur_mac, &len) != ESP_OK ||
+            len != 6 || memcmp(cur_mac, mac, 6) != 0) {
+            nvs_set_blob(handle, "console_mac", mac, 6);
+            nvs_commit(handle);
+        }
         nvs_close(handle);
         memcpy(paired_console_mac, mac, 6);
         is_paired = true;
@@ -148,6 +158,10 @@ static bool load_bonding_from_nvs(void)
 
 static void clear_bonding_nvs(void)
 {
+    if (!is_paired) {
+        memset(paired_console_mac, 0, 6);
+        return;
+    }
     nvs_handle_t handle;
     if (nvs_open("gamepad", NVS_READWRITE, &handle) == ESP_OK) {
         nvs_erase_key(handle, "console_mac");
@@ -164,8 +178,11 @@ static void save_channel_to_nvs(uint8_t ch)
         return; // Skip redundant writes
     nvs_handle_t handle;
     if (nvs_open("gamepad", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_set_u8(handle, "wifi_chan", ch);
-        nvs_commit(handle);
+        uint8_t cur_ch = 0;
+        if (nvs_get_u8(handle, "wifi_chan", &cur_ch) != ESP_OK || cur_ch != ch) {
+            nvs_set_u8(handle, "wifi_chan", ch);
+            nvs_commit(handle);
+        }
         nvs_close(handle);
         saved_channel = ch;
     }
@@ -190,15 +207,32 @@ static void set_gamepad_channel(uint8_t ch)
         return;
     current_channel = ch;
 
-    wifi_config_t ap_config;
-    if (esp_wifi_get_config(WIFI_IF_AP, &ap_config) == ESP_OK) {
-        if (ap_config.ap.channel != ch) {
-            ap_config.ap.channel = ch;
-            esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (web_controller_enabled) {
+        wifi_config_t ap_config;
+        if (esp_wifi_get_config(WIFI_IF_AP, &ap_config) == ESP_OK) {
+            if (ap_config.ap.channel != ch) {
+                ap_config.ap.channel = ch;
+                esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+            }
         }
     }
     esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
 }
+
+typedef enum {
+    GP_EV_PAIR_ACK,
+    GP_EV_ACK,
+    GP_EV_CHAN_SWITCH,
+    GP_EV_UNPAIR,
+} gamepad_rx_ev_type_t;
+
+typedef struct {
+    gamepad_rx_ev_type_t type;
+    uint8_t console_mac[6];
+    uint8_t channel;
+} gamepad_rx_ev_t;
+
+static QueueHandle_t rx_ev_queue = NULL;
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 static void espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len)
@@ -226,14 +260,29 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
 
     // Handle pairing confirmation from console
     if (packet->buttons == RG_ESPNOW_CMD_PAIR_ACK) {
-        save_bonding_to_nvs(packet->console_mac);
         last_ack_time = now_ms;
         channel_locked = true;
-        uint8_t ch = (packet->channel >= 1 && packet->channel <= 13) ? packet->channel : current_channel;
-        set_gamepad_channel(ch);
-        ESP_LOGI(TAG, "Bonded successfully with Console %02X:%02X:%02X:%02X:%02X:%02X on Channel %d",
-                 packet->console_mac[0], packet->console_mac[1], packet->console_mac[2],
-                 packet->console_mac[3], packet->console_mac[4], packet->console_mac[5], current_channel);
+        if (rx_ev_queue) {
+            gamepad_rx_ev_t ev = {
+                .type = GP_EV_PAIR_ACK,
+                .channel = packet->channel,
+            };
+            memcpy(ev.console_mac, packet->console_mac, 6);
+            xQueueSend(rx_ev_queue, &ev, 0);
+        }
+        return;
+    }
+
+    // Handle unpair notification from console
+    if (packet->buttons == RG_ESPNOW_CMD_UNPAIR) {
+        if (is_paired && memcmp(packet->console_mac, paired_console_mac, 6) == 0) {
+            if (rx_ev_queue) {
+                gamepad_rx_ev_t ev = {
+                    .type = GP_EV_UNPAIR,
+                };
+                xQueueSend(rx_ev_queue, &ev, 0);
+            }
+        }
         return;
     }
 
@@ -244,25 +293,16 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
         }
     }
 
-    // Console sends back normal ACK
-    if (packet->buttons == RG_ESPNOW_CMD_ACK) {
+    if (packet->buttons == RG_ESPNOW_CMD_ACK || packet->buttons == RG_ESPNOW_CMD_CHAN_SWITCH) {
         last_ack_time = now_ms;
         channel_locked = true;
-        if (packet->channel >= 1 && packet->channel <= 13 && packet->channel != current_channel) {
-            set_gamepad_channel(packet->channel);
-            ESP_LOGI(TAG, "Console sync on Channel %d, switching directly!", current_channel);
-        } else if (!channel_locked) {
-            set_gamepad_channel(current_channel);
-            ESP_LOGI(TAG, "Console sync acquired on Channel %d!", current_channel);
-        }
-    }
-    // Proactive channel switch command from paired console
-    else if (packet->buttons == RG_ESPNOW_CMD_CHAN_SWITCH) {
-        last_ack_time = now_ms;
-        channel_locked = true;
-        if (packet->channel >= 1 && packet->channel <= 13 && packet->channel != current_channel) {
-            set_gamepad_channel(packet->channel);
-            ESP_LOGI(TAG, "Proactively switched to Channel %d instructed by Console.", current_channel);
+        if (rx_ev_queue) {
+            gamepad_rx_ev_t ev = {
+                .type = (packet->buttons == RG_ESPNOW_CMD_ACK) ? GP_EV_ACK : GP_EV_CHAN_SWITCH,
+                .channel = packet->channel,
+            };
+            memcpy(ev.console_mac, packet->console_mac, 6);
+            xQueueSend(rx_ev_queue, &ev, 0);
         }
     }
 }
@@ -271,7 +311,9 @@ static void buttons_init(void)
 {
     uint64_t pin_mask = 0;
     for (size_t i = 0; i < BUTTON_COUNT; i++) {
-        pin_mask |= (1ULL << BUTTONS[i].pin);
+        if (BUTTONS[i].pin != GPIO_NUM_NC && BUTTONS[i].pin >= 0) {
+            pin_mask |= (1ULL << BUTTONS[i].pin);
+        }
     }
 
     gpio_config_t io_conf = {
@@ -285,7 +327,9 @@ static void buttons_init(void)
 
     // Configure GPIO wakeup for light sleep
     for (size_t i = 0; i < BUTTON_COUNT; i++) {
-        gpio_wakeup_enable(BUTTONS[i].pin, GPIO_INTR_LOW_LEVEL);
+        if (BUTTONS[i].pin != GPIO_NUM_NC && BUTTONS[i].pin >= 0) {
+            gpio_wakeup_enable(BUTTONS[i].pin, GPIO_INTR_LOW_LEVEL);
+        }
     }
     esp_sleep_enable_gpio_wakeup();
 }
@@ -293,6 +337,36 @@ static void buttons_init(void)
 // Ultra-fast GPIO read using hardware register (1 CPU cycle for all GPIOs)
 static inline uint16_t read_buttons_raw(void)
 {
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+    uint32_t inv = ~REG_READ(GPIO_IN_REG);
+    uint16_t keys = 0;
+
+    // D-Pad: GPIO 0 (UP), GPIO 1 (DOWN), GPIO 2 (LEFT), GPIO 3 (RIGHT)
+    if (inv & (1 << PIN_UP))    keys |= RG_KEY_UP;
+    if (inv & (1 << PIN_DOWN))  keys |= RG_KEY_DOWN;
+    if (inv & (1 << PIN_LEFT))  keys |= RG_KEY_LEFT;
+    if (inv & (1 << PIN_RIGHT)) keys |= RG_KEY_RIGHT;
+
+    // Action buttons: GPIO 4 (A), 5 (B), 6 (X), 7 (Y) -> shifted left by 4 maps directly to bits 8..11
+    keys |= (uint16_t)((inv & 0xF0) << 4);
+
+    // Shoulder buttons
+    if (PIN_L >= 0 && (inv & (1 << (PIN_L >= 0 ? PIN_L : 0))))     keys |= RG_KEY_L;
+    if (PIN_R >= 0 && (inv & (1 << (PIN_R >= 0 ? PIN_R : 0))))     keys |= RG_KEY_R;
+
+    // Select / Start: GPIO 20 (SELECT), GPIO 21 (START) -> shifted right by 16 maps directly to bits 4..5
+    keys |= (uint16_t)((inv & (0x3 << 20)) >> 16);
+
+    if (PIN_MENU >= 0 && (inv & (1 << (PIN_MENU >= 0 ? PIN_MENU : 0)))) keys |= RG_KEY_MENU;
+
+    // Virtual MENU combo: SELECT + UP (frees physical BOOT pin GPIO 9)
+    if ((keys & (RG_KEY_SELECT | RG_KEY_UP)) == (RG_KEY_SELECT | RG_KEY_UP)) {
+        keys &= ~(RG_KEY_SELECT | RG_KEY_UP);
+        keys |= RG_KEY_MENU;
+    }
+
+    return keys;
+#else
     uint32_t gpio_val0 = REG_READ(GPIO_IN_REG);
 #if defined(GPIO_IN1_REG)
     uint32_t gpio_val1 = REG_READ(GPIO_IN1_REG);
@@ -301,6 +375,8 @@ static inline uint16_t read_buttons_raw(void)
 
     for (size_t i = 0; i < BUTTON_COUNT; i++) {
         gpio_num_t pin = BUTTONS[i].pin;
+        if (pin == GPIO_NUM_NC || pin < 0)
+            continue;
         bool pressed = false;
 #if defined(GPIO_IN1_REG)
         if (pin >= 32) {
@@ -316,6 +392,24 @@ static inline uint16_t read_buttons_raw(void)
         }
     }
     return keys;
+#endif
+}
+
+static void blink_led_pattern(int count, int on_ms, int off_ms)
+{
+#ifdef PIN_LED
+    for (int i = 0; i < count; i++) {
+        gpio_set_direction(PIN_LED, GPIO_MODE_OUTPUT);
+        gpio_set_level(PIN_LED, 0); // Active LOW: LED ON
+        vTaskDelay(pdMS_TO_TICKS(on_ms));
+
+        // LED OFF: Open-Drain Hi-Z via INPUT with pull-up.
+        // Never drive push-pull HIGH (3.3V) to prevent shorting if Button L (GPIO 8) is pressed!
+        gpio_set_direction(PIN_LED, GPIO_MODE_INPUT);
+        gpio_set_pull_mode(PIN_LED, GPIO_PULLUP_ONLY);
+        vTaskDelay(pdMS_TO_TICKS(off_ms));
+    }
+#endif
 }
 
 static void init_gamepad_pairing(void)
@@ -327,7 +421,12 @@ static void init_gamepad_pairing(void)
     // Boot combo: SELECT + START held together clears bonding bond
     if ((boot_keys & (RG_KEY_SELECT | RG_KEY_START)) == (RG_KEY_SELECT | RG_KEY_START)) {
         clear_bonding_nvs();
-        ESP_LOGW(TAG, "Pairing bond cleared! Entering discovery pairing mode.");
+        blink_led_pattern(5, 60, 60);
+        ESP_LOGW(TAG, "Boot combo: Pairing bond cleared! Entering discovery pairing mode.");
+    } else if (boot_keys & RG_KEY_START) {
+        web_controller_enabled = true;
+        blink_led_pattern(3, 80, 80);
+        ESP_LOGI(TAG, "Boot key: Web Controller (SoftAP) enabled on demand!");
     }
 
     active_player_id = 0;
@@ -342,19 +441,7 @@ static void init_gamepad_pairing(void)
 
 static void indicate_ready_led(void)
 {
-#ifdef PIN_LED
-    // Onboard status LED: Blink 1x on boot
-    gpio_set_direction(PIN_LED, GPIO_MODE_OUTPUT);
-    gpio_set_level(PIN_LED, 0); // Active LOW on most ESP boards
-    vTaskDelay(pdMS_TO_TICKS(150));
-    gpio_set_level(PIN_LED, 1);
-    vTaskDelay(pdMS_TO_TICKS(150));
-#if defined(CONFIG_IDF_TARGET_ESP32C3)
-    // ESP32-C3 SuperMini: PIN_LED is shared with PIN_L (GPIO 8). Restore to input with pullup.
-    gpio_set_direction(PIN_LED, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(PIN_LED, GPIO_PULLUP_ONLY);
-#endif
-#endif
+    blink_led_pattern(1, 150, 100);
 }
 
 // -----------------------------------------------------------------------------
@@ -419,6 +506,8 @@ static esp_err_t ws_handler(httpd_req_t *req)
 static esp_err_t http_get_index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
     httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -455,13 +544,6 @@ static httpd_handle_t start_webserver(void)
 
 static void wifi_espnow_init(uint8_t player_id)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
     is_paired = load_bonding_from_nvs();
     current_channel = load_channel_from_nvs();
     saved_channel = current_channel;
@@ -470,27 +552,33 @@ static void wifi_espnow_init(uint8_t player_id)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_sta();
-    esp_netif_create_default_wifi_ap();
+    if (web_controller_enabled) {
+        esp_netif_create_default_wifi_ap();
+    }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
-    wifi_config_t ap_config = {
-        .ap = {
-            .channel = current_channel,
-            .password = "",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN,
-        },
-    };
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
-    snprintf((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), "RetroGo-Pad-%02X%02X", mac[4], mac[5]);
-    ap_config.ap.ssid_len = strlen((char *)ap_config.ap.ssid);
+    if (web_controller_enabled) {
+        wifi_config_t ap_config = {
+            .ap = {
+                .channel = current_channel,
+                .password = "",
+                .max_connection = 4,
+                .authmode = WIFI_AUTH_OPEN,
+            },
+        };
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+        snprintf((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), "RetroGo-Pad-%02X%02X", mac[4], mac[5]);
+        ap_config.ap.ssid_len = strlen((char *)ap_config.ap.ssid);
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    } else {
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    }
     ESP_ERROR_CHECK(esp_wifi_start());
 
     set_gamepad_channel(current_channel);
@@ -514,12 +602,22 @@ static void wifi_espnow_init(uint8_t player_id)
 
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 
-    ESP_LOGI(TAG, "ESP-NOW Gamepad TX ready on Channel %d. Paired: %s",
-             current_channel, is_paired ? "YES" : "NO (Discovery Mode)");
+    ESP_LOGI(TAG, "ESP-NOW Gamepad TX ready on Channel %d (Web Controller: %s). Paired: %s",
+             current_channel, web_controller_enabled ? "ON" : "OFF (Standby)", is_paired ? "YES" : "NO (Discovery Mode)");
 }
 
 void app_main(void)
 {
+    // 1. Initialize NVS flash first before ANY NVS access (boot combo unpairing, bonding load)
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
+    rx_ev_queue = xQueueCreate(8, sizeof(gamepad_rx_ev_t));
+
     buttons_init();
 
     init_gamepad_pairing();
@@ -527,7 +625,9 @@ void app_main(void)
     buttons_init(); // Re-arm GPIO as input with pull-up
 
     wifi_espnow_init(0);
-    start_webserver();
+    if (web_controller_enabled) {
+        start_webserver();
+    }
 
     uint16_t debounced_gpio_state = 0;
     uint16_t last_sample = 0;
@@ -550,6 +650,33 @@ void app_main(void)
         int64_t now_us = esp_timer_get_time();
         int64_t now_ms = now_us / 1000;
 
+        // Process deferred events from ESP-NOW recv callback (NVS write, channel switch)
+        gamepad_rx_ev_t rx_ev;
+        while (rx_ev_queue && xQueueReceive(rx_ev_queue, &rx_ev, 0) == pdTRUE) {
+            if (rx_ev.type == GP_EV_PAIR_ACK) {
+                save_bonding_to_nvs(rx_ev.console_mac);
+                memcpy(packet.console_mac, paired_console_mac, 6);
+                uint8_t ch = (rx_ev.channel >= 1 && rx_ev.channel <= 13) ? rx_ev.channel : current_channel;
+                set_gamepad_channel(ch);
+                blink_led_pattern(2, 100, 100);
+                ESP_LOGI(TAG, "Bonded successfully with Console %02X:%02X:%02X:%02X:%02X:%02X on Channel %d",
+                         rx_ev.console_mac[0], rx_ev.console_mac[1], rx_ev.console_mac[2],
+                         rx_ev.console_mac[3], rx_ev.console_mac[4], rx_ev.console_mac[5], current_channel);
+            } else if (rx_ev.type == GP_EV_UNPAIR) {
+                clear_bonding_nvs();
+                channel_locked = false;
+                last_hop_time = now_ms;
+                blink_led_pattern(5, 60, 60);
+                ESP_LOGW(TAG, "Unpaired by Console command! Entering discovery mode.");
+            } else if (rx_ev.type == GP_EV_ACK || rx_ev.type == GP_EV_CHAN_SWITCH) {
+                if (rx_ev.channel >= 1 && rx_ev.channel <= 13 && rx_ev.channel != current_channel) {
+                    set_gamepad_channel(rx_ev.channel);
+                    ESP_LOGI(TAG, "%s to Channel %d instructed by Console.",
+                             (rx_ev.type == GP_EV_ACK) ? "Console sync" : "Proactively switched", current_channel);
+                }
+            }
+        }
+
         // 1. Single-cycle hardware register read for physical buttons
         uint16_t current_sample = read_buttons_raw();
 
@@ -565,12 +692,36 @@ void app_main(void)
         last_sample = current_sample;
 
         // 3. Safety Watchdog: clear web buttons if client disconnected or idle > 1.5s
-        if (web_buttons != 0 && (now_us - web_last_activity > 1500000)) {
+        if (web_controller_enabled) {
+            if (web_buttons != 0 && (now_us - web_last_activity > 1500000)) {
+                web_buttons = 0;
+            }
+        } else {
             web_buttons = 0;
         }
 
-        // 4. Merge Physical GPIO buttons + Web Virtual buttons seamlessly!
+        // 4. Merge Physical GPIO buttons + Web Virtual buttons (if enabled)
         uint16_t current_buttons = debounced_gpio_state | web_buttons;
+
+        // Runtime 3s hold of SELECT + START triggers unpair on-the-fly
+        static int64_t unpair_hold_start = 0;
+        if ((current_buttons & (RG_KEY_SELECT | RG_KEY_START)) == (RG_KEY_SELECT | RG_KEY_START)) {
+            if (unpair_hold_start == 0) {
+                unpair_hold_start = now_ms;
+            } else if (now_ms - unpair_hold_start >= 3000) {
+                clear_bonding_nvs();
+                channel_locked = false;
+                last_hop_time = now_ms;
+                blink_led_pattern(5, 60, 60);
+                ESP_LOGW(TAG, "Runtime 3s hold: Pairing cleared! Entering discovery mode.");
+                unpair_hold_start = 0;
+                while ((read_buttons_raw() & (RG_KEY_SELECT | RG_KEY_START))) {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+            }
+        } else {
+            unpair_hold_start = 0;
+        }
 
         // Track activity for sleep timeout (physical buttons or web activity)
         if (current_buttons != 0 || (now_us - web_last_activity < 60000000LL)) {
@@ -649,8 +800,9 @@ void app_main(void)
             }
         }
 
-        // 8. Power management: Enter light-sleep if idle for 60 seconds
-        if (current_buttons == 0 && (now_ms - last_activity_time > LIGHT_SLEEP_TIMEOUT_MS)) {
+        // 8. Power management: Enter light-sleep if idle (15s if searching, 60s if connected)
+        int64_t idle_timeout = channel_locked ? LIGHT_SLEEP_TIMEOUT_MS : 15000;
+        if (current_buttons == 0 && (now_ms - last_activity_time > idle_timeout)) {
             ESP_LOGI(TAG, "Entering light-sleep mode (idle). Press any button to wake up.");
             if (is_paired) {
                 packet.buttons = 0;
@@ -661,8 +813,16 @@ void app_main(void)
                 esp_now_send(BROADCAST_MAC, (const uint8_t *)&packet, sizeof(packet));
             }
 
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(20));
+            esp_wifi_stop();
             esp_light_sleep_start();
+
+            // Woke up from light sleep: restore buttons and Wi-Fi stack
+            buttons_init();
+            esp_wifi_start();
+            set_gamepad_channel(current_channel);
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
 
             now_ms = esp_timer_get_time() / 1000;
             last_activity_time = now_ms;

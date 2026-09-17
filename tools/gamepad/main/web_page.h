@@ -235,24 +235,6 @@ static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
     color: #9ea3b5;
     text-shadow: 0 1px 2px #000;
   }
-  .player-pill {
-    background: #2b2e3b;
-    color: #4fc3f7;
-    font-size: 9px;
-    font-weight: 900;
-    padding: 2px 8px;
-    border-radius: 10px;
-    letter-spacing: 1px;
-    border: 1px solid #3c4052;
-    cursor: pointer;
-    user-select: none;
-    transition: transform 0.05s, background 0.1s;
-  }
-  .player-pill:active {
-    background: #0288d1;
-    color: #fff;
-    transform: scale(0.95);
-  }
   .pair-pill {
     background: #3b2b2b;
     color: #ff8a80;
@@ -544,12 +526,11 @@ static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
     transition: transform 0.05s, box-shadow 0.05s, filter 0.05s;
   }
   .btn-orb:active, .btn-orb.active {
-    transform: translateY(3px);
     box-shadow: 0 2px 0 #0e0f13, inset 0 3px 5px rgba(0, 0, 0, 0.85);
     filter: brightness(1.2);
   }
 
-  /* SFC 4-COLOR THEME */
+  /* SFC 4-COLOR THEME (Preserve base translate on active to avoid position jump) */
   .btn-x-orb {
     top: 6px;
     left: 50%;
@@ -557,6 +538,10 @@ static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
     background: radial-gradient(circle at 35% 30%, #29b6f6 0%, #0277bd 70%, #01579b 100%);
     border: 2px solid #4fc3f7;
   }
+  .btn-x-orb:active, .btn-x-orb.active {
+    transform: translate(-50%, 3px);
+  }
+
   .btn-y-orb {
     top: 50%;
     left: 6px;
@@ -564,6 +549,10 @@ static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
     background: radial-gradient(circle at 35% 30%, #66bb6a 0%, #2e7d32 70%, #1b5e20 100%);
     border: 2px solid #81c784;
   }
+  .btn-y-orb:active, .btn-y-orb.active {
+    transform: translateY(calc(-50% + 3px));
+  }
+
   .btn-b-orb {
     bottom: 6px;
     left: 50%;
@@ -571,12 +560,19 @@ static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
     background: radial-gradient(circle at 35% 30%, #ffa726 0%, #e65100 70%, #bf360c 100%);
     border: 2px solid #ffb74d;
   }
+  .btn-b-orb:active, .btn-b-orb.active {
+    transform: translate(-50%, 3px);
+  }
+
   .btn-a-orb {
     top: 50%;
     right: 6px;
     transform: translateY(-50%);
     background: radial-gradient(circle at 35% 30%, #ef5350 0%, #c62828 70%, #8e0000 100%);
     border: 2px solid #e57373;
+  }
+  .btn-a-orb:active, .btn-a-orb.active {
+    transform: translateY(calc(-50% + 3px));
   }
 
   /* Counter-rotate button labels upright */

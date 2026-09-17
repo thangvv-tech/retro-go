@@ -21,7 +21,10 @@
 #if defined(CONFIG_IDF_TARGET_ESP32C3)
 // =========================================================================
 // Target: ESP32-C3 (SuperMini / Zero / DevKit)
-// 13 dedicated external GPIOs (pins < 32 for single-cycle REG_READ)
+// 12 dedicated external GPIOs (pins < 32 for single-cycle REG_READ)
+// - Avoid GPIO 9 (BOOT pin) to prevent download mode latchup on power-on
+// - Avoid GPIO 8 (Onboard LED) unless 12th button (L) is explicitly needed
+// - MENU is mapped to virtual combo (SELECT + UP)
 // =========================================================================
 #define BOARD_TARGET_NAME "ESP32-C3 SuperMini"
 
@@ -33,11 +36,11 @@
 #define PIN_B       GPIO_NUM_5   // Button B
 #define PIN_X       GPIO_NUM_6   // Button X
 #define PIN_Y       GPIO_NUM_7   // Button Y
-#define PIN_L       GPIO_NUM_8   // Button L (also onboard blue LED on C3 SuperMini)
-#define PIN_MENU    GPIO_NUM_9   // External Button MENU (Header Pin 9)
+#define PIN_L       GPIO_NUM_8   // Button L (Shared with onboard LED, open-drain protected)
 #define PIN_R       GPIO_NUM_10  // Button R
 #define PIN_SELECT  GPIO_NUM_20  // Button SELECT
 #define PIN_START   GPIO_NUM_21  // Button START
+#define PIN_MENU    GPIO_NUM_NC  // Free GPIO 9 (BOOT pin) from button duty; use SELECT + UP combo
 #define PIN_LED     GPIO_NUM_8   // Onboard LED (Active LOW)
 
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)

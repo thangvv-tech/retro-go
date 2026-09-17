@@ -65,6 +65,7 @@ static uint32_t gamepad_mapped = 0;
 #define RG_ESPNOW_CMD_PAIR_REQ     0xFFFE // Gamepad -> Console: Request pairing
 #define RG_ESPNOW_CMD_PAIR_ACK     0xFFFD // Console -> Gamepad: Confirm pairing with console MAC
 #define RG_ESPNOW_CMD_CHAN_SWITCH  0xFFFC // Console -> Gamepad: Switch channel immediately
+#define RG_ESPNOW_CMD_UNPAIR       0xFFFB // Console -> Gamepad: Unpair command
 
 typedef struct __attribute__((packed)) {
     uint16_t magic;          // 0x4752 ('R', 'G')
@@ -84,6 +85,7 @@ static uint8_t espnow_gamepad_mac[6];
 static bool espnow_gamepad_bound = false;
 static uint8_t espnow_bonded_mac[6] = {0};
 static bool espnow_has_bonded_mac = false;
+static int64_t espnow_pairing_window_until = 0;
 static uint8_t console_self_mac[6] = {0};
 static uint8_t espnow_current_channel = RG_GAMEPAD_WIFI_CHANNEL;
 static const uint8_t espnow_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -91,11 +93,21 @@ static const uint8_t espnow_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x
 static portMUX_TYPE espnow_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // Deferred worker: recv_cb only enqueues here; actual NVS writes and esp_now_send happen in worker task
-typedef enum { ESPNOW_EV_ACK, ESPNOW_EV_PAIR_ACK, ESPNOW_EV_NVS_SAVE } espnow_ev_type_t;
+typedef enum {
+    ESPNOW_EV_ACK,
+    ESPNOW_EV_PAIR_ACK,
+    ESPNOW_EV_NVS_SAVE,
+    ESPNOW_EV_NVS_ERASE,
+    ESPNOW_EV_CHAN_SWITCH,
+    ESPNOW_EV_UNPAIR,
+} espnow_ev_type_t;
+
 typedef struct {
     espnow_ev_type_t type;
-    rg_espnow_gamepad_packet_t pkt;   // packet to send (ACK / PAIR_ACK)
+    rg_espnow_gamepad_packet_t pkt;   // packet to send (ACK / PAIR_ACK / CHAN_SWITCH / UNPAIR)
     uint8_t mac[6];
+    uint8_t old_chan;
+    uint8_t new_chan;
 } espnow_ev_t;
 static QueueHandle_t espnow_ev_queue;
 
@@ -113,14 +125,66 @@ static void espnow_worker_task(void *arg)
         case ESPNOW_EV_PAIR_ACK:
             esp_now_send(espnow_broadcast_mac, (const uint8_t *)&ev.pkt, sizeof(ev.pkt));
             break;
+        case ESPNOW_EV_UNPAIR:
+            for (int i = 0; i < 6; i++)
+            {
+                esp_now_send(espnow_broadcast_mac, (const uint8_t *)&ev.pkt, sizeof(ev.pkt));
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            break;
         case ESPNOW_EV_NVS_SAVE:
             if (nvs_open("retro-go", NVS_READWRITE, &h) == ESP_OK)
             {
-                nvs_set_blob(h, "gp_mac", ev.mac, 6);
+                uint8_t cur_mac[6];
+                size_t len = sizeof(cur_mac);
+                if (nvs_get_blob(h, "gp_mac", cur_mac, &len) != ESP_OK ||
+                    len != 6 || memcmp(cur_mac, ev.mac, 6) != 0)
+                {
+                    nvs_set_blob(h, "gp_mac", ev.mac, 6);
+                    nvs_commit(h);
+                }
+                nvs_close(h);
+            }
+            break;
+        case ESPNOW_EV_NVS_ERASE:
+            if (nvs_open("retro-go", NVS_READWRITE, &h) == ESP_OK)
+            {
+                nvs_erase_key(h, "gp_mac");
+                nvs_erase_key(h, "gp_mac_p1");
                 nvs_commit(h);
                 nvs_close(h);
             }
             break;
+        case ESPNOW_EV_CHAN_SWITCH:
+        {
+            uint8_t current_radio_chan = 0;
+            wifi_second_chan_t second_chan;
+            esp_wifi_get_channel(&current_radio_chan, &second_chan);
+
+            // Skip promiscuous hop if WiFi STA is actively connected to an AP — disrupts DHCP/data path
+            wifi_ap_record_t ap_info;
+            bool sta_connected = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
+            if (!sta_connected && ev.old_chan >= 1 && ev.old_chan <= 13 && current_radio_chan != ev.old_chan)
+            {
+                esp_wifi_set_promiscuous(true);
+                esp_wifi_set_channel(ev.old_chan, WIFI_SECOND_CHAN_NONE);
+                for (int i = 0; i < 6; i++)
+                {
+                    esp_now_send(espnow_broadcast_mac, (const uint8_t *)&ev.pkt, sizeof(ev.pkt));
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+                esp_wifi_set_channel(current_radio_chan, WIFI_SECOND_CHAN_NONE);
+                esp_wifi_set_promiscuous(false);
+            }
+
+            for (int i = 0; i < 6; i++)
+            {
+                esp_now_send(espnow_broadcast_mac, (const uint8_t *)&ev.pkt, sizeof(ev.pkt));
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            RG_LOGI("ESP-NOW: Broadcasted channel switch notice (%d -> %d).", ev.old_chan, ev.new_chan);
+            break;
+        }
         }
     }
 }
@@ -156,7 +220,8 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
 
     if (packet->buttons == RG_ESPNOW_CMD_ACK ||
         packet->buttons == RG_ESPNOW_CMD_PAIR_ACK ||
-        packet->buttons == RG_ESPNOW_CMD_CHAN_SWITCH)
+        packet->buttons == RG_ESPNOW_CMD_CHAN_SWITCH ||
+        packet->buttons == RG_ESPNOW_CMD_UNPAIR)
         return;
 
 #if RG_GAMEPAD_SYSTEM_ID > 0
@@ -169,20 +234,27 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
     // 1. Explicit pairing request
     if (packet->buttons == RG_ESPNOW_CMD_PAIR_REQ)
     {
-        if (espnow_has_bonded_mac && espnow_gamepad_connected &&
+        bool pairing_window_active = (now < espnow_pairing_window_until);
+        if (!pairing_window_active && espnow_has_bonded_mac && espnow_gamepad_connected &&
             (now - espnow_last_packet_time < 2000000) &&
             memcmp(espnow_bonded_mac, src_mac, 6) != 0)
             return;
+
+        bool mac_changed = !espnow_has_bonded_mac || (memcmp(espnow_bonded_mac, src_mac, 6) != 0);
 
         memcpy(espnow_gamepad_mac, src_mac, 6);
         memcpy(espnow_bonded_mac, src_mac, 6);
         espnow_has_bonded_mac = true;
         espnow_gamepad_bound = true;
-        // Defer NVS write to worker — never block in recv callback
-        espnow_enqueue_nvs_save(src_mac);
+        espnow_pairing_window_until = 0; // Pairing fulfilled
 
-        RG_LOGI("ESP-NOW: Pairing accepted from %02X:%02X:%02X:%02X:%02X:%02X",
-                src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+        // Only save to NVS if MAC actually changed
+        if (mac_changed)
+        {
+            espnow_enqueue_nvs_save(src_mac);
+            RG_LOGI("ESP-NOW: Pairing accepted from %02X:%02X:%02X:%02X:%02X:%02X (saved to NVS)",
+                    src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+        }
 
         rg_espnow_gamepad_packet_t pair_ack = {
             .magic = RG_ESPNOW_GAMEPAD_MAGIC,
@@ -199,22 +271,9 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
         return;
     }
 
-    // 2. Normal button packets: bonding check
-    if (espnow_has_bonded_mac)
-    {
-        if (memcmp(espnow_bonded_mac, src_mac, 6) != 0)
-            return;
-    }
-    else
-    {
-        memcpy(espnow_gamepad_mac, src_mac, 6);
-        memcpy(espnow_bonded_mac, src_mac, 6);
-        espnow_has_bonded_mac = true;
-        espnow_gamepad_bound = true;
-        espnow_enqueue_nvs_save(src_mac);
-        RG_LOGI("ESP-NOW: Auto-bonded to MAC %02X:%02X:%02X:%02X:%02X:%02X",
-                src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
-    }
+    // 2. Normal button packets: strictly accept ONLY from bonded controller
+    if (!espnow_has_bonded_mac || memcmp(espnow_bonded_mac, src_mac, 6) != 0)
+        return;
 
     uint8_t active_radio_channel = espnow_current_channel;
     wifi_second_chan_t second;
@@ -321,50 +380,6 @@ static void espnow_gamepad_init(void)
                        RG_KEY_L | RG_KEY_R);
 }
 
-typedef struct {
-    uint8_t old_chan;
-    uint8_t new_chan;
-    rg_espnow_gamepad_packet_t pkt;
-} espnow_chan_switch_args_t;
-
-static void espnow_chan_switch_task(void *arg)
-{
-    espnow_chan_switch_args_t *a = (espnow_chan_switch_args_t *)arg;
-
-    uint8_t current_radio_chan = 0;
-    wifi_second_chan_t second_chan;
-    esp_wifi_get_channel(&current_radio_chan, &second_chan);
-
-    // 1. Transmit on old_chan so gamepad receives notice immediately.
-    // Skip promiscuous hop if WiFi is actively connected — disrupts DHCP/data path.
-    wifi_mode_t wifi_mode = WIFI_MODE_NULL;
-    esp_wifi_get_mode(&wifi_mode);
-    bool wifi_connected = (wifi_mode == WIFI_MODE_STA || wifi_mode == WIFI_MODE_APSTA);
-    if (!wifi_connected && a->old_chan >= 1 && a->old_chan <= 13 && current_radio_chan != a->old_chan)
-    {
-        esp_wifi_set_promiscuous(true);
-        esp_wifi_set_channel(a->old_chan, WIFI_SECOND_CHAN_NONE);
-        for (int i = 0; i < 8; i++)
-        {
-            esp_now_send(espnow_broadcast_mac, (const uint8_t *)&a->pkt, sizeof(a->pkt));
-            vTaskDelay(1);
-        }
-        esp_wifi_set_channel(current_radio_chan, WIFI_SECOND_CHAN_NONE);
-        esp_wifi_set_promiscuous(false);
-    }
-
-    // 2. Also transmit on new_chan
-    for (int i = 0; i < 8; i++)
-    {
-        esp_now_send(espnow_broadcast_mac, (const uint8_t *)&a->pkt, sizeof(a->pkt));
-        vTaskDelay(1);
-    }
-
-    RG_LOGI("ESP-NOW: Broadcasted channel switch notice (%d -> %d).", a->old_chan, a->new_chan);
-    free(a);
-    vTaskDelete(NULL);
-}
-
 void rg_input_espnow_notify_channel_switch(uint8_t new_channel)
 {
     if (new_channel < 1 || new_channel > 13)
@@ -373,35 +388,88 @@ void rg_input_espnow_notify_channel_switch(uint8_t new_channel)
     uint8_t old_chan = espnow_current_channel;
     espnow_current_channel = new_channel;
 
-    if (old_chan == new_channel)
+    if (old_chan == new_channel || !espnow_ev_queue)
         return;
 
-    espnow_chan_switch_args_t *args = malloc(sizeof(espnow_chan_switch_args_t));
-    if (!args)
-    {
-        RG_LOGW("ESP-NOW: channel switch notify OOM.");
-        return;
-    }
-
-    args->old_chan = old_chan;
-    args->new_chan = new_channel;
-    args->pkt = (rg_espnow_gamepad_packet_t){
-        .magic = RG_ESPNOW_GAMEPAD_MAGIC,
-        .system_id = RG_GAMEPAD_SYSTEM_ID,
-        .buttons = RG_ESPNOW_CMD_CHAN_SWITCH,
-        .seq = 0,
-        .player_id = 0,
-        .channel = new_channel,
-        .reserved = 0,
+    espnow_ev_t ev = {
+        .type = ESPNOW_EV_CHAN_SWITCH,
+        .old_chan = old_chan,
+        .new_chan = new_channel,
+        .pkt = {
+            .magic = RG_ESPNOW_GAMEPAD_MAGIC,
+            .system_id = RG_GAMEPAD_SYSTEM_ID,
+            .buttons = RG_ESPNOW_CMD_CHAN_SWITCH,
+            .seq = 0,
+            .player_id = 0,
+            .channel = new_channel,
+            .reserved = 0,
+        },
     };
-    memcpy(args->pkt.console_mac, console_self_mac, 6);
+    memcpy(ev.pkt.console_mac, console_self_mac, 6);
+    xQueueSend(espnow_ev_queue, &ev, 0);
+}
 
-    // Run in background task to avoid blocking the event loop with busy-wait sends
-    if (xTaskCreate(espnow_chan_switch_task, "espnow_ch", 2048, args, 5, NULL) != pdPASS)
+bool rg_input_espnow_is_bonded(void)
+{
+    return espnow_has_bonded_mac;
+}
+
+bool rg_input_espnow_is_connected(void)
+{
+    return espnow_gamepad_connected;
+}
+
+const uint8_t *rg_input_espnow_get_bonded_mac(void)
+{
+    return espnow_has_bonded_mac ? espnow_bonded_mac : NULL;
+}
+
+void rg_input_espnow_start_pairing(int timeout_ms)
+{
+    espnow_pairing_window_until = rg_system_timer() + ((int64_t)timeout_ms * 1000);
+    RG_LOGI("ESP-NOW: Pairing discovery window opened for %d ms", timeout_ms);
+}
+
+void rg_input_espnow_unpair(void)
+{
+    if (!espnow_has_bonded_mac)
+        return;
+
+    // 1. Notify the gamepad that it has been unpaired so it resets and enters discovery
+    if (espnow_ev_queue)
     {
-        RG_LOGW("ESP-NOW: Failed to create channel switch task.");
-        free(args);
+        espnow_ev_t ev = {
+            .type = ESPNOW_EV_UNPAIR,
+            .pkt = {
+                .magic = RG_ESPNOW_GAMEPAD_MAGIC,
+                .system_id = RG_GAMEPAD_SYSTEM_ID,
+                .buttons = RG_ESPNOW_CMD_UNPAIR,
+                .seq = 0,
+                .player_id = 0,
+                .channel = espnow_current_channel,
+                .reserved = 0,
+            },
+        };
+        memcpy(ev.pkt.console_mac, console_self_mac, 6);
+        xQueueSend(espnow_ev_queue, &ev, 0);
+
+        // 2. Erase from NVS
+        espnow_ev_t erase_ev = { .type = ESPNOW_EV_NVS_ERASE };
+        xQueueSend(espnow_ev_queue, &erase_ev, 0);
     }
+
+    // 3. Reset internal RAM state
+    portENTER_CRITICAL(&espnow_mux);
+    espnow_has_bonded_mac = false;
+    espnow_gamepad_bound = false;
+    espnow_gamepad_connected = false;
+    espnow_gamepad_state = 0;
+    memset(espnow_bonded_mac, 0, 6);
+    memset(espnow_gamepad_mac, 0, 6);
+    espnow_pairing_window_until = 0;
+    portEXIT_CRITICAL(&espnow_mux);
+
+    RG_LOGI("ESP-NOW: Gamepad bond cleared and unpaired.");
 }
 #endif
 static bool input_task_running = false;
@@ -781,14 +849,6 @@ uint32_t rg_input_read_gamepad(void)
         espnow_gamepad_state = 0;
         portEXIT_CRITICAL(&espnow_mux);
         pstate = 0;
-        // Release bonding after 5s so a new controller can auto-bond
-        if (diff > 5000000 && espnow_gamepad_bound)
-        {
-            espnow_gamepad_bound = false;
-            espnow_has_bonded_mac = false;
-            memset(espnow_bonded_mac, 0, 6);
-            RG_LOGI("ESP-NOW: Gamepad slot released for new controllers.");
-        }
     }
     state |= pstate;
 #endif

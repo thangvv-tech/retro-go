@@ -2025,6 +2025,88 @@ static rg_gui_event_t wifi_cb(rg_gui_option_t *option, rg_gui_event_t event)
 }
 #endif
 
+#if defined(RG_GAMEPAD_USE_ESPNOW)
+static rg_gui_event_t wireless_gamepad_status_cb(rg_gui_option_t *option, rg_gui_event_t event)
+{
+    if (option->arg == 0x01)
+    {
+        if (rg_input_espnow_is_connected())
+            strcpy(option->value, _("Connected"));
+        else if (rg_input_espnow_is_bonded())
+            strcpy(option->value, _("Disconnected"));
+        else
+            strcpy(option->value, _("Not paired"));
+    }
+    else if (option->arg == 0x02)
+    {
+        const uint8_t *mac = rg_input_espnow_get_bonded_mac();
+        if (mac)
+            snprintf(option->value, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        else
+            strcpy(option->value, _("None"));
+    }
+    return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t wireless_gamepad_pair_cb(rg_gui_option_t *option, rg_gui_event_t event)
+{
+    if (event == RG_DIALOG_ENTER)
+    {
+        rg_input_espnow_start_pairing(15000);
+        rg_gui_alert(_("Pair Gamepad"), _("Pairing window open (15s).\n\nTurn on gamepad or hold\nSELECT + START for 3s."));
+        return RG_DIALOG_REDRAW;
+    }
+    return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t wireless_gamepad_unpair_cb(rg_gui_option_t *option, rg_gui_event_t event)
+{
+    if (event == RG_DIALOG_ENTER)
+    {
+        if (!rg_input_espnow_is_bonded())
+        {
+            rg_gui_alert(_("Unpair Gamepad"), _("No gamepad paired."));
+            return RG_DIALOG_VOID;
+        }
+        if (rg_gui_confirm(_("Unpair Gamepad"), _("Forget paired gamepad?"), false))
+        {
+            rg_input_espnow_unpair();
+            rg_gui_alert(_("Unpair Gamepad"), _("Gamepad unpaired."));
+            return RG_DIALOG_REDRAW;
+        }
+    }
+    return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t wireless_gamepad_cb(rg_gui_option_t *option, rg_gui_event_t event)
+{
+    if (event == RG_DIALOG_ENTER)
+    {
+        const rg_gui_option_t options[] = {
+            {0x01, _("Status"),         "-",  RG_DIALOG_FLAG_MESSAGE, &wireless_gamepad_status_cb},
+            {0x02, _("Bonded MAC"),     "-",  RG_DIALOG_FLAG_MESSAGE, &wireless_gamepad_status_cb},
+            RG_DIALOG_SEPARATOR,
+            {0x00, _("Pair gamepad"),   NULL, RG_DIALOG_FLAG_NORMAL,  &wireless_gamepad_pair_cb  },
+            {0x00, _("Unpair gamepad"), NULL, RG_DIALOG_FLAG_NORMAL,  &wireless_gamepad_unpair_cb},
+            RG_DIALOG_END,
+        };
+        rg_gui_dialog(option->label, options, 0);
+        return RG_DIALOG_REDRAW;
+    }
+    if (event == RG_DIALOG_INIT || event == RG_DIALOG_UPDATE)
+    {
+        if (rg_input_espnow_is_connected())
+            strcpy(option->value, _("Connected"));
+        else if (rg_input_espnow_is_bonded())
+            strcpy(option->value, _("Paired"));
+        else
+            strcpy(option->value, _("None"));
+    }
+    return RG_DIALOG_VOID;
+}
+#endif
+
 static rg_gui_event_t app_options_cb(rg_gui_option_t *option, rg_gui_event_t event)
 {
     if (event == RG_DIALOG_ENTER)
@@ -2045,7 +2127,7 @@ static rg_gui_event_t app_options_cb(rg_gui_option_t *option, rg_gui_event_t eve
 
 void rg_gui_options_menu(void)
 {
-    rg_gui_option_t options[20] = {
+    rg_gui_option_t options[32] = {
         #if RG_SCREEN_BACKLIGHT
         {0, _("Brightness"),    "-", RG_DIALOG_FLAG_NORMAL, &brightness_update_cb},
         #endif
@@ -2064,6 +2146,9 @@ void rg_gui_options_menu(void)
         #endif
         #ifdef RG_ENABLE_NETWORKING
         {0, _("Wi-Fi options"), NULL, RG_DIALOG_FLAG_NORMAL, &wifi_cb},
+        #endif
+        #if defined(RG_GAMEPAD_USE_ESPNOW)
+        {0, _("Wireless Gamepad"), "-", RG_DIALOG_FLAG_NORMAL, &wireless_gamepad_cb},
         #endif
         {0, _("Launcher options"), NULL, RG_DIALOG_FLAG_NORMAL, &app_options_cb},
         RG_DIALOG_END,

@@ -19,10 +19,10 @@ menu "Wireless Gamepad Configuration"
 
     config GAMEPAD_POLL_INTERVAL_MS
         int "Hardware polling interval in milliseconds"
-        default 3
+        default 1
         range 1 20
         help
-            Sampling interval for button inputs. 3ms provides ~330Hz sampling rate.
+            Sampling interval for button inputs. 1ms provides 1000Hz sampling rate.
 
     config GAMEPAD_HEARTBEAT_INTERVAL_MS
         int "Heartbeat keepalive interval in milliseconds"

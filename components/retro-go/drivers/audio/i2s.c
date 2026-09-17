@@ -116,7 +116,12 @@ static bool driver_init(int device, int sample_rate)
 
 static bool driver_set_sample_rates(int sampleRate)
 {
-    return i2s_set_sample_rates(I2S_NUM_0, sampleRate) == ESP_OK;
+    bool ok = (i2s_set_sample_rates(I2S_NUM_0, sampleRate) == ESP_OK);
+#ifdef RG_AUDIO_USE_ES8311
+    if (ok)
+        es8311_config_clock(sampleRate);
+#endif
+    return ok;
 }
 
 static bool driver_deinit(void)
