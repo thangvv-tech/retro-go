@@ -911,6 +911,7 @@ intptr_t rg_gui_dialog(const char *title, const rg_gui_option_t *options_const, 
     int sel = RG_MIN(RG_MAX(0, selected_index), options_count - 1);
     int sel_old = -1;
 
+    rg_display_force_redraw();
     rg_gui_draw_status_bars();
     rg_gui_draw_dialog(title, options, options_count, sel);
     rg_input_wait_for_key(RG_KEY_ALL, false, 1000);
@@ -1459,13 +1460,11 @@ static rg_gui_event_t audio_update_cb(rg_gui_option_t *option, rg_gui_event_t ev
     size_t count = 0;
     const rg_audio_sink_t *sinks = rg_audio_get_sinks(&count);
     const rg_audio_sink_t *ssink = rg_audio_get_sink();
-    // Hide dummy unless it's the only one or we're a debug build
-    int min = rg_system_get_app()->isRelease ? (1 % count) : (0);
+    int min = 0;
     int max = count - 1;
     int sink = 0;
 
-    // If there's no choice to be made we can just hide the entry
-    if (min == max)
+    if (count <= 1)
     {
         option->flags |= RG_DIALOG_FLAG_HIDDEN;
         return RG_DIALOG_VOID;
@@ -1479,11 +1478,19 @@ static rg_gui_event_t audio_update_cb(rg_gui_option_t *option, rg_gui_event_t ev
 
     if (event == RG_DIALOG_PREV && --sink < min)
         sink = max;
-    if (event == RG_DIALOG_NEXT && ++sink > max)
+    if ((event == RG_DIALOG_NEXT || event == RG_DIALOG_ENTER) && ++sink > max)
         sink = min;
 
     if (sink != prev_sink)
+    {
         rg_audio_set_sink(sinks[sink].driver->name, sinks[sink].device);
+        ssink = rg_audio_get_sink();
+        for (int i = 0; i < count; ++i)
+            if (sinks[i].driver == ssink->driver && sinks[i].device == ssink->device)
+                sink = i;
+        strcpy(option->value, sinks[sink].name);
+        return RG_DIALOG_REDRAW;
+    }
 
     strcpy(option->value, sinks[sink].name);
 
@@ -1622,6 +1629,7 @@ static rg_gui_event_t led_indicator_cb(rg_gui_option_t *option, rg_gui_event_t e
             RG_DIALOG_END,
         };
         rg_gui_dialog(option->label, options, 0);
+        return RG_DIALOG_REDRAW;
     }
     return RG_DIALOG_VOID;
 }
@@ -2020,17 +2028,45 @@ static rg_gui_event_t wifi_cb(rg_gui_option_t *option, rg_gui_event_t event)
             RG_DIALOG_END,
         };
         rg_gui_dialog(option->label, options, 0);
+        return RG_DIALOG_REDRAW;
     }
     return RG_DIALOG_VOID;
 }
 #endif
 
 #if defined(RG_GAMEPAD_USE_ESPNOW)
+static rg_gui_event_t wireless_gamepad_enable_cb(rg_gui_option_t *option, rg_gui_event_t event)
+{
+    bool is_enabled = rg_input_espnow_is_enabled();
+
+    if (event == RG_DIALOG_PREV || event == RG_DIALOG_NEXT || event == RG_DIALOG_ENTER)
+    {
+        bool enable;
+        if (event == RG_DIALOG_PREV)
+            enable = false;
+        else if (event == RG_DIALOG_NEXT)
+            enable = true;
+        else
+            enable = !is_enabled;
+
+        if (enable != is_enabled)
+        {
+            rg_input_espnow_set_enabled(enable);
+            return RG_DIALOG_REDRAW;
+        }
+        return RG_DIALOG_VOID;
+    }
+    strcpy(option->value, is_enabled ? _("On") : _("Off"));
+    return RG_DIALOG_VOID;
+}
+
 static rg_gui_event_t wireless_gamepad_status_cb(rg_gui_option_t *option, rg_gui_event_t event)
 {
     if (option->arg == 0x01)
     {
-        if (rg_input_espnow_is_connected())
+        if (!rg_input_espnow_is_enabled())
+            strcpy(option->value, _("Disabled"));
+        else if (rg_input_espnow_is_connected())
             strcpy(option->value, _("Connected"));
         else if (rg_input_espnow_is_bonded())
             strcpy(option->value, _("Disconnected"));
@@ -2053,6 +2089,8 @@ static rg_gui_event_t wireless_gamepad_pair_cb(rg_gui_option_t *option, rg_gui_e
 {
     if (event == RG_DIALOG_ENTER)
     {
+        if (!rg_input_espnow_is_enabled())
+            rg_input_espnow_set_enabled(true);
         rg_input_espnow_start_pairing(15000);
         rg_gui_alert(_("Pair Gamepad"), _("Pairing window open (15s).\n\nTurn on gamepad or hold\nSELECT + START for 3s."));
         return RG_DIALOG_REDRAW;
@@ -2067,7 +2105,7 @@ static rg_gui_event_t wireless_gamepad_unpair_cb(rg_gui_option_t *option, rg_gui
         if (!rg_input_espnow_is_bonded())
         {
             rg_gui_alert(_("Unpair Gamepad"), _("No gamepad paired."));
-            return RG_DIALOG_VOID;
+            return RG_DIALOG_REDRAW;
         }
         if (rg_gui_confirm(_("Unpair Gamepad"), _("Forget paired gamepad?"), false))
         {
@@ -2075,6 +2113,7 @@ static rg_gui_event_t wireless_gamepad_unpair_cb(rg_gui_option_t *option, rg_gui
             rg_gui_alert(_("Unpair Gamepad"), _("Gamepad unpaired."));
             return RG_DIALOG_REDRAW;
         }
+        return RG_DIALOG_REDRAW;
     }
     return RG_DIALOG_VOID;
 }
@@ -2084,24 +2123,16 @@ static rg_gui_event_t wireless_gamepad_cb(rg_gui_option_t *option, rg_gui_event_
     if (event == RG_DIALOG_ENTER)
     {
         const rg_gui_option_t options[] = {
-            {0x01, _("Status"),         "-",  RG_DIALOG_FLAG_MESSAGE, &wireless_gamepad_status_cb},
-            {0x02, _("Bonded MAC"),     "-",  RG_DIALOG_FLAG_MESSAGE, &wireless_gamepad_status_cb},
+            {0x00, _("Wireless enable"), "-",  RG_DIALOG_FLAG_NORMAL,  &wireless_gamepad_enable_cb},
+            {0x01, _("Status"),          "-",  RG_DIALOG_FLAG_MESSAGE, &wireless_gamepad_status_cb},
+            {0x02, _("Bonded MAC"),      "-",  RG_DIALOG_FLAG_MESSAGE, &wireless_gamepad_status_cb},
             RG_DIALOG_SEPARATOR,
-            {0x00, _("Pair gamepad"),   NULL, RG_DIALOG_FLAG_NORMAL,  &wireless_gamepad_pair_cb  },
-            {0x00, _("Unpair gamepad"), NULL, RG_DIALOG_FLAG_NORMAL,  &wireless_gamepad_unpair_cb},
+            {0x00, _("Pair gamepad"),    NULL, RG_DIALOG_FLAG_NORMAL,  &wireless_gamepad_pair_cb  },
+            {0x00, _("Unpair gamepad"),  NULL, RG_DIALOG_FLAG_NORMAL,  &wireless_gamepad_unpair_cb},
             RG_DIALOG_END,
         };
         rg_gui_dialog(option->label, options, 0);
         return RG_DIALOG_REDRAW;
-    }
-    if (event == RG_DIALOG_INIT || event == RG_DIALOG_UPDATE)
-    {
-        if (rg_input_espnow_is_connected())
-            strcpy(option->value, _("Connected"));
-        else if (rg_input_espnow_is_bonded())
-            strcpy(option->value, _("Paired"));
-        else
-            strcpy(option->value, _("None"));
     }
     return RG_DIALOG_VOID;
 }
@@ -2148,7 +2179,7 @@ void rg_gui_options_menu(void)
         {0, _("Wi-Fi options"), NULL, RG_DIALOG_FLAG_NORMAL, &wifi_cb},
         #endif
         #if defined(RG_GAMEPAD_USE_ESPNOW)
-        {0, _("Wireless Gamepad"), "-", RG_DIALOG_FLAG_NORMAL, &wireless_gamepad_cb},
+        {0, _("Gamepad options"), NULL, RG_DIALOG_FLAG_NORMAL, &wireless_gamepad_cb},
         #endif
         {0, _("Launcher options"), NULL, RG_DIALOG_FLAG_NORMAL, &app_options_cb},
         RG_DIALOG_END,

@@ -89,6 +89,7 @@ static int64_t espnow_pairing_window_until = 0;
 static uint8_t console_self_mac[6] = {0};
 static uint8_t espnow_current_channel = RG_GAMEPAD_WIFI_CHANNEL;
 static const uint8_t espnow_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static bool espnow_enabled = true;
 // Protects espnow_gamepad_state written from WiFi task, read from emulator task (dual-core)
 static portMUX_TYPE espnow_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -211,6 +212,9 @@ static void espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_
 static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data_len)
 {
 #endif
+    if (!espnow_enabled)
+        return;
+
     if (data_len < (int)sizeof(rg_espnow_gamepad_packet_t))
         return;
 
@@ -311,6 +315,11 @@ static void espnow_gamepad_init(void)
     nvs_handle_t h;
     if (nvs_open("retro-go", NVS_READONLY, &h) == ESP_OK)
     {
+        uint8_t en = 1;
+        if (nvs_get_u8(h, "gp_en", &en) == ESP_OK)
+        {
+            espnow_enabled = (en != 0);
+        }
         size_t len = 6;
         if ((nvs_get_blob(h, "gp_mac", espnow_bonded_mac, &len) == ESP_OK && len == 6) ||
             (nvs_get_blob(h, "gp_mac_p1", espnow_bonded_mac, &len) == ESP_OK && len == 6))
@@ -416,7 +425,7 @@ bool rg_input_espnow_is_bonded(void)
 
 bool rg_input_espnow_is_connected(void)
 {
-    return espnow_gamepad_connected;
+    return espnow_enabled && espnow_gamepad_connected;
 }
 
 const uint8_t *rg_input_espnow_get_bonded_mac(void)
@@ -470,6 +479,35 @@ void rg_input_espnow_unpair(void)
     portEXIT_CRITICAL(&espnow_mux);
 
     RG_LOGI("ESP-NOW: Gamepad bond cleared and unpaired.");
+}
+
+bool rg_input_espnow_is_enabled(void)
+{
+    return espnow_enabled;
+}
+
+void rg_input_espnow_set_enabled(bool enable)
+{
+    if (espnow_enabled == enable)
+        return;
+
+    espnow_enabled = enable;
+
+    nvs_handle_t h;
+    if (nvs_open("retro-go", NVS_READWRITE, &h) == ESP_OK)
+    {
+        nvs_set_u8(h, "gp_en", enable ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    if (!enable)
+    {
+        portENTER_CRITICAL(&espnow_mux);
+        espnow_gamepad_connected = false;
+        espnow_gamepad_state = 0;
+        portEXIT_CRITICAL(&espnow_mux);
+    }
 }
 #endif
 static bool input_task_running = false;
@@ -815,7 +853,7 @@ bool rg_input_key_is_present(rg_key_t mask)
 {
     uint32_t mapped = gamepad_mapped;
 #if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
-    if (espnow_gamepad_connected)
+    if (espnow_enabled && espnow_gamepad_connected)
     {
         mapped |= (RG_KEY_UP | RG_KEY_DOWN | RG_KEY_LEFT | RG_KEY_RIGHT |
                    RG_KEY_A | RG_KEY_B | RG_KEY_START | RG_KEY_SELECT);
@@ -832,25 +870,28 @@ uint32_t rg_input_read_gamepad(void)
     uint32_t state = gamepad_state;
 
 #if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
-    portENTER_CRITICAL(&espnow_mux);
-    int64_t last = espnow_last_packet_time;
-    uint32_t pstate = espnow_gamepad_state;
-    portEXIT_CRITICAL(&espnow_mux);
-
-    int64_t diff = rg_system_timer() - last;
-    if (diff > 500000)
+    if (espnow_enabled)
     {
-        if (espnow_gamepad_connected)
-        {
-            espnow_gamepad_connected = false;
-            RG_LOGI("ESP-NOW: Wireless gamepad disconnected.");
-        }
         portENTER_CRITICAL(&espnow_mux);
-        espnow_gamepad_state = 0;
+        int64_t last = espnow_last_packet_time;
+        uint32_t pstate = espnow_gamepad_state;
         portEXIT_CRITICAL(&espnow_mux);
-        pstate = 0;
+
+        int64_t diff = rg_system_timer() - last;
+        if (diff > 500000)
+        {
+            if (espnow_gamepad_connected)
+            {
+                espnow_gamepad_connected = false;
+                RG_LOGI("ESP-NOW: Wireless gamepad disconnected.");
+            }
+            portENTER_CRITICAL(&espnow_mux);
+            espnow_gamepad_state = 0;
+            portEXIT_CRITICAL(&espnow_mux);
+            pstate = 0;
+        }
+        state |= pstate;
     }
-    state |= pstate;
 #endif
 
     return state;

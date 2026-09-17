@@ -28,7 +28,7 @@
 // driver_submit (32000/50). Using a single large buffer risks blocking the call needlessly because
 // some apps submit more than once per cycle or there could be occasional jitter (early submission).
 #define DMA_BUFFER_COUNT 4
-#define DMA_BUFFER_LEN 180
+#define DMA_BUFFER_LEN 128
 
 static struct {
     const char *last_error;
@@ -37,15 +37,41 @@ static struct {
     bool muted;
 } state;
 
+static bool i2s_installed = false;
+static int installed_device = -1;
+
+static bool driver_set_sample_rates(int sampleRate);
+static bool driver_set_mute(bool mute);
+
 static bool driver_init(int device, int sample_rate)
 {
     state.last_error = NULL;
     state.device = device;
+    state.volume = 100;
+
+    if (i2s_installed && installed_device == device)
+    {
+        driver_set_sample_rates(sample_rate);
+    #ifdef RG_AUDIO_USE_ES8311
+        es8311_init(sample_rate);
+    #endif
+        driver_set_mute(false);
+        return true;
+    }
+
+    if (i2s_installed)
+    {
+        i2s_driver_uninstall(I2S_NUM_0);
+        i2s_installed = false;
+        installed_device = -1;
+    }
+
+    esp_err_t ret = ESP_FAIL;
 
     if (state.device == 0)
     {
     #if RG_AUDIO_USE_INT_DAC
-        esp_err_t ret = i2s_driver_install(I2S_NUM_0, &(i2s_config_t){
+        ret = i2s_driver_install(I2S_NUM_0, &(i2s_config_t){
             .mode = I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN,
             .sample_rate = sample_rate,
             .bits_per_sample = 16,
@@ -57,16 +83,15 @@ static bool driver_init(int device, int sample_rate)
         }, 0, NULL);
         if (ret == ESP_OK)
             ret = i2s_set_dac_mode(RG_AUDIO_USE_INT_DAC);
-        if (ret != ESP_OK)
-            state.last_error = esp_err_to_name(ret);
     #else
         state.last_error = "This device does not support internal DAC mode!";
+        return false;
     #endif
     }
     else if (state.device == 1)
     {
     #if RG_AUDIO_USE_EXT_DAC
-        esp_err_t ret = i2s_driver_install(I2S_NUM_0, &(i2s_config_t){
+        ret = i2s_driver_install(I2S_NUM_0, &(i2s_config_t){
             .mode = I2S_MODE_MASTER | I2S_MODE_TX,
             .sample_rate = sample_rate,
             .bits_per_sample = 16,
@@ -96,22 +121,40 @@ static bool driver_init(int device, int sample_rate)
         if (ret == ESP_OK)
         {
         #ifdef RG_AUDIO_USE_ES8311
+            vTaskDelay(pdMS_TO_TICKS(10));
             if (!es8311_init(sample_rate))
-                RG_LOGW("ES8311 codec init failed, audio may not work.\n");
+            {
+                RG_LOGE("ES8311 codec init failed!\n");
+                state.last_error = "ES8311 codec init failed";
+                ret = ESP_FAIL;
+            }
         #endif
         }
-        if (ret != ESP_OK)
-            state.last_error = esp_err_to_name(ret);
     #else
         state.last_error = "This device does not support external DAC mode!";
+        return false;
     #endif
     }
+
+    if (ret != ESP_OK)
+    {
+        if (state.last_error == NULL)
+            state.last_error = esp_err_to_name(ret);
+        i2s_driver_uninstall(I2S_NUM_0);
+        i2s_installed = false;
+        installed_device = -1;
+        return false;
+    }
+
+    i2s_installed = true;
+    installed_device = device;
+
     #ifdef RG_GPIO_SND_AMP_ENABLE
         gpio_reset_pin(RG_GPIO_SND_AMP_ENABLE);
         gpio_set_level(RG_GPIO_SND_AMP_ENABLE, MUTE_ENABLE);
         gpio_set_direction(RG_GPIO_SND_AMP_ENABLE, GPIO_MODE_OUTPUT);
     #endif
-    return state.last_error == NULL;
+    return true;
 }
 
 static bool driver_set_sample_rates(int sampleRate)
@@ -126,24 +169,9 @@ static bool driver_set_sample_rates(int sampleRate)
 
 static bool driver_deinit(void)
 {
-    i2s_driver_uninstall(I2S_NUM_0);
-    if (state.device == 0)
-    {
-    #if RG_AUDIO_USE_INT_DAC
-        i2s_set_dac_mode(I2S_DAC_CHANNEL_DISABLE);
-    #endif
-    }
-    else if (state.device == 1)
-    {
-    #if RG_AUDIO_USE_EXT_DAC
-        gpio_reset_pin(RG_GPIO_SND_I2S_BCK);
-        gpio_reset_pin(RG_GPIO_SND_I2S_DATA);
-        gpio_reset_pin(RG_GPIO_SND_I2S_WS);
-    #endif
-    }
-    #ifdef RG_GPIO_SND_AMP_ENABLE
-    gpio_reset_pin(RG_GPIO_SND_AMP_ENABLE);
-    #endif
+    driver_set_mute(true);
+    if (i2s_installed)
+        i2s_zero_dma_buffer(I2S_NUM_0);
     return true;
 }
 

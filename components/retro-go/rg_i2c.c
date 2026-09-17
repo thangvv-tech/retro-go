@@ -6,7 +6,10 @@
 #if defined(ESP_PLATFORM) && defined(RG_GPIO_I2C_SDA) && defined(RG_GPIO_I2C_SCL)
 #include <driver/i2c.h>
 #include <esp_err.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #define USE_I2C_DRIVER 1
+static SemaphoreHandle_t i2c_mutex = NULL;
 #endif
 
 static bool i2c_initialized = false;
@@ -27,9 +30,12 @@ bool rg_i2c_init(void)
         .scl_io_num = RG_GPIO_I2C_SCL,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 400000,
+        .master.clk_speed = 100000,
     };
     esp_err_t err = ESP_FAIL;
+
+    if (!i2c_mutex)
+        i2c_mutex = xSemaphoreCreateRecursiveMutex();
 
     if (i2c_initialized)
         return true;
@@ -61,6 +67,9 @@ bool rg_i2c_deinit(void)
 bool rg_i2c_read(uint8_t addr, int reg, void *read_data, size_t read_len)
 {
 #if USE_I2C_DRIVER
+    if (i2c_mutex)
+        xSemaphoreTakeRecursive(i2c_mutex, portMAX_DELAY);
+
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     esp_err_t err = ESP_FAIL;
 
@@ -79,10 +88,14 @@ bool rg_i2c_read(uint8_t addr, int reg, void *read_data, size_t read_len)
     TRY(i2c_master_stop(cmd));
     TRY(i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(500)));
     i2c_cmd_link_delete(cmd);
+    if (i2c_mutex)
+        xSemaphoreGiveRecursive(i2c_mutex);
     return true;
 fail:
     i2c_cmd_link_delete(cmd);
     RG_LOGE("Read from 0x%02X failed. reg=0x%02X, err=0x%03X, init=%d\n", addr, reg, err, i2c_initialized);
+    if (i2c_mutex)
+        xSemaphoreGiveRecursive(i2c_mutex);
 #endif
     return false;
 }
@@ -90,6 +103,9 @@ fail:
 bool rg_i2c_write(uint8_t addr, int reg, const void *write_data, size_t write_len)
 {
 #if USE_I2C_DRIVER
+    if (i2c_mutex)
+        xSemaphoreTakeRecursive(i2c_mutex, portMAX_DELAY);
+
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     esp_err_t err = ESP_FAIL;
 
@@ -106,10 +122,14 @@ bool rg_i2c_write(uint8_t addr, int reg, const void *write_data, size_t write_le
     TRY(i2c_master_stop(cmd));
     TRY(i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(500)));
     i2c_cmd_link_delete(cmd);
+    if (i2c_mutex)
+        xSemaphoreGiveRecursive(i2c_mutex);
     return true;
 fail:
     i2c_cmd_link_delete(cmd);
     RG_LOGE("Write to 0x%02X failed. reg=0x%02X, err=0x%03X, init=%d\n", addr, reg, err, i2c_initialized);
+    if (i2c_mutex)
+        xSemaphoreGiveRecursive(i2c_mutex);
 #endif
     return false;
 }

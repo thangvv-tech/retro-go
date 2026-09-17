@@ -105,4 +105,6 @@ bool rg_input_espnow_is_connected(void);
 const uint8_t *rg_input_espnow_get_bonded_mac(void);
 void rg_input_espnow_unpair(void);
 void rg_input_espnow_start_pairing(int timeout_ms);
+bool rg_input_espnow_is_enabled(void);
+void rg_input_espnow_set_enabled(bool enable);
 #endif

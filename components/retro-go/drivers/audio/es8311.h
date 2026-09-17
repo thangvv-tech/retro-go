@@ -10,7 +10,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#define ES8311_ADDR             0x18  // ADDR pin = 0 (GND)
+#define ES8311_ADDR_DEFAULT     0x18  // CE pin = 0 (GND)
 
 // Register addresses
 #define ES8311_REG_RESET        0x00
@@ -28,120 +28,125 @@
 #define ES8311_REG_ADC_MUTE     0x0E
 #define ES8311_REG_DAC_SET1     0x12
 #define ES8311_REG_DAC_SET2     0x13
-#define ES8311_REG_DAC_VCTRL    0x32  // DAC volume 0x00=0dB, 0xFF=-96dB
+#define ES8311_REG_DAC_VCTRL    0x32  // DAC volume: 0x00 = -96dB (mute), 0xBF = 0dB
 #define ES8311_REG_DAC_MUTE     0x31
 #define ES8311_REG_ADC_EQ       0x1C
 #define ES8311_REG_DAC_EQ       0x37
+#define ES8311_REG_CHIP_ID1     0xFD
+#define ES8311_REG_CHIP_ID2     0xFE
+#define ES8311_REG_CHIP_VER     0xFF
 
-// SDP word length: 16-bit = 0b11 at bits[3:2]
+// SDP word length: 16-bit = 0b11 at bits[3:2] (3 << 2 = 0x0C)
 #define ES8311_SDP_16BIT        0x0C
+
+static uint8_t es8311_i2c_addr = ES8311_ADDR_DEFAULT;
 
 static inline bool es8311_wr(uint8_t reg, uint8_t val)
 {
-    return rg_i2c_write_byte(ES8311_ADDR, reg, val);
+    return rg_i2c_write_byte(es8311_i2c_addr, reg, val);
 }
 
 static inline int es8311_rd(uint8_t reg)
 {
-    return rg_i2c_read_byte(ES8311_ADDR, reg);
+    return rg_i2c_read_byte(es8311_i2c_addr, reg);
 }
 
-// Compute clock dividers for given sample_rate assuming MCLK = 256 * sample_rate
+// Configure clock dividers assuming MCLK = 256 * sample_rate from ESP32 I2S master
 static inline bool es8311_config_clock(int sample_rate)
 {
-    if (sample_rate <= 0)
-        sample_rate = 44100;
+    (void)sample_rate;
 
-    // ESP32 I2S output: MCLK = 256 * sample_rate, BCLK = 64 * sample_rate (32 bits * 2ch or 16 bits * 2ch with divider)
-    // LRCK = sample_rate
-    // In slave mode, ES8311 expects BCLK divider = MCLK / BCLK = 256 / 32 = 8 (register value = 8 - 1 = 7)
-    // and LRCK divider = 32 * 2 = 64 BCLK ticks per frame.
-    uint8_t pre = 0x00;    // REG02: pre_div=1, pre_multi=1
-    uint8_t adc_osr = 0x00;
-    uint8_t dac_osr = 0x00;
-    uint8_t clk_div = 0x00; // REG05: adc_div=1, dac_div=1
-    uint8_t bclk_div = 8 - 1; // REG06: div by 8
-    uint16_t lrck = 64;       // REG07/08: 64 BCLKs per LRCK
+    bool ok = true;
+    ok &= es8311_wr(ES8311_REG_CLK_PRE,  0x00);
+    ok &= es8311_wr(ES8311_REG_ADC_OSR,  0x10);
+    ok &= es8311_wr(ES8311_REG_DAC_OSR,  0x10);
+    ok &= es8311_wr(ES8311_REG_CLK_DIV,  0x00);
+    ok &= es8311_wr(ES8311_REG_CLK_BCLK, 0x03); // bclk_div = 4 -> reg val 3
+    ok &= es8311_wr(ES8311_REG_LRCK_H,   0x00);
+    ok &= es8311_wr(ES8311_REG_LRCK_L,   0xFF);
 
-    if (sample_rate < 24000)
-    {
-        dac_osr = 0x01;
-    }
-
-    es8311_wr(ES8311_REG_CLK_PRE, pre);
-    es8311_wr(ES8311_REG_ADC_OSR, adc_osr);
-    es8311_wr(ES8311_REG_DAC_OSR, dac_osr);
-    es8311_wr(ES8311_REG_CLK_DIV, clk_div);
-    es8311_wr(ES8311_REG_CLK_BCLK, bclk_div);
-    es8311_wr(ES8311_REG_LRCK_H, (lrck >> 8) & 0xFF);
-    es8311_wr(ES8311_REG_LRCK_L, lrck & 0xFF);
-
-    return true;
+    return ok;
 }
 
 static inline bool es8311_init(int sample_rate)
 {
     if (!rg_i2c_init())
+    {
+        RG_LOGE("ES8311: I2C init failed!\n");
         return false;
+    }
 
-    // Reset
-    es8311_wr(ES8311_REG_RESET, 0x1F);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    es8311_i2c_addr = ES8311_ADDR_DEFAULT;
+
+    // Reset chip (try 0x18 first, then fallback to 0x19)
+    if (!es8311_wr(ES8311_REG_RESET, 0x1F))
+    {
+        es8311_i2c_addr = 0x19;
+        if (!es8311_wr(ES8311_REG_RESET, 0x1F))
+        {
+            RG_LOGE("ES8311 not responding on I2C (tried 0x18, 0x19)!\n");
+            es8311_i2c_addr = ES8311_ADDR_DEFAULT;
+            return false;
+        }
+        RG_LOGI("ES8311 detected at alternate I2C 0x19\n");
+    }
+    else
+    {
+        RG_LOGI("ES8311 detected at I2C 0x18\n");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
     es8311_wr(ES8311_REG_RESET, 0x00);
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(10));
+    // Start CSM (Clock State Machine power on: bit 7 = 1)
+    es8311_wr(ES8311_REG_RESET, 0x80);
 
-    // Enable all clocks, MCLK from MCLK pin (not from BCLK)
+    // Enable internal clocks, MCLK from MCLK pin
     es8311_wr(ES8311_REG_CLK_MAN1, 0x3F);
 
-    // Slave mode (bit6=0)
-    int r = es8311_rd(ES8311_REG_RESET);
-    if (r < 0) r = 0x80;
-    es8311_wr(ES8311_REG_RESET, (uint8_t)(r & 0xBF));
-
+    // Clock dividers for MCLK = 256 * fs
     es8311_config_clock(sample_rate);
 
-    // I2S: 16-bit standard (Philips) for both Rx (DAC) and Tx (ADC)
+    // Slave mode (bit 6 = 0) + CSM on (bit 7 = 1)
+    es8311_wr(ES8311_REG_RESET, 0x80);
+
+    // Standard Philips 16-bit I2S format
     es8311_wr(ES8311_REG_SDP_IN,  ES8311_SDP_16BIT);
     es8311_wr(ES8311_REG_SDP_OUT, ES8311_SDP_16BIT);
 
-    // Analog power, DAC path
-    es8311_wr(ES8311_REG_SYSTEM,   0x01); // power analog section
-    es8311_wr(ES8311_REG_ADC_MUTE, 0x02); // ADC modulator on but muted (not using mic)
-    es8311_wr(ES8311_REG_DAC_SET1, 0x00); // power up DAC
-    es8311_wr(ES8311_REG_DAC_SET2, 0x10); // enable HP driver output
+    // Power up analog circuitry & DAC path
+    es8311_wr(ES8311_REG_SYSTEM,   0x01); // Power up analog circuitry
+    es8311_wr(ES8311_REG_ADC_MUTE, 0x02); // Enable analog PGA & ADC modulator
+    es8311_wr(ES8311_REG_DAC_SET1, 0x00); // Power up DAC
+    es8311_wr(ES8311_REG_DAC_SET2, 0x10); // Enable output to HP / PA drive
 
     // EQ bypass
     es8311_wr(ES8311_REG_ADC_EQ, 0x6A);
     es8311_wr(ES8311_REG_DAC_EQ, 0x08);
 
-    // Default volume: 0 dB
-    es8311_wr(ES8311_REG_DAC_VCTRL, 0x00);
+    // Set DAC hardware volume to 0 dB (0xBF = 0dB unity gain)
+    es8311_wr(ES8311_REG_DAC_VCTRL, 0xBF);
 
-    // Unmute DAC output
-    int rv = es8311_rd(ES8311_REG_DAC_MUTE);
-    if (rv < 0) rv = 0;
-    es8311_wr(ES8311_REG_DAC_MUTE, (uint8_t)(rv & ~(BIT(6) | BIT(5))));
+    // Unmute DAC output (clear bits 6 and 5)
+    es8311_wr(ES8311_REG_DAC_MUTE, 0x00);
 
-    RG_LOGI("ES8311 codec initialized (rate=%d).\n", sample_rate);
+    RG_LOGI("ES8311 codec initialized (addr=0x%02X, rate=%d).\n", es8311_i2c_addr, sample_rate);
     return true;
 }
 
 static inline bool es8311_set_volume(int percent)
 {
-    uint8_t val = (uint8_t)((100 - percent) * 0xBF / 100);
+    if (percent <= 0)
+        return es8311_wr(ES8311_REG_DAC_VCTRL, 0x00);
+    if (percent > 100)
+        percent = 100;
+    uint8_t val = (uint8_t)(percent * 0xBF / 100);
     return es8311_wr(ES8311_REG_DAC_VCTRL, val);
 }
 
 static inline bool es8311_set_mute(bool mute)
 {
-    int rv = es8311_rd(ES8311_REG_DAC_MUTE);
-    if (rv < 0) return false;
-    uint8_t v = (uint8_t)rv;
-    if (mute)
-        v |= (BIT(6) | BIT(5));
-    else
-        v &= ~(BIT(6) | BIT(5));
-    return es8311_wr(ES8311_REG_DAC_MUTE, v);
+    return es8311_wr(ES8311_REG_DAC_MUTE, mute ? 0x60 : 0x00);
 }
 
 #endif // RG_AUDIO_USE_ES8311

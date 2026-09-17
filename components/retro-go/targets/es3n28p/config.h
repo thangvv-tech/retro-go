@@ -103,7 +103,7 @@
 #define RG_GPIO_SND_I2S_MCLK        GPIO_NUM_4
 #define RG_GPIO_SND_I2S_BCK         GPIO_NUM_5
 #define RG_GPIO_SND_I2S_WS          GPIO_NUM_7
-#define RG_GPIO_SND_I2S_DATA        GPIO_NUM_6
+#define RG_GPIO_SND_I2S_DATA        GPIO_NUM_8
 // IO1: SC8002B SHUTDOWN pin (Low = enable amp, High = disable) -> use INVERT flag
 #define RG_GPIO_SND_AMP_ENABLE      GPIO_NUM_1
 #define RG_GPIO_SND_AMP_ENABLE_INVERT
