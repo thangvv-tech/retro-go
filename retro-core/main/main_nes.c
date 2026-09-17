@@ -257,18 +257,16 @@ void nes_main(void)
 
     rg_system_set_tick_rate(nes->refresh_rate);
     app->frameskip = 0;
-    input_connect(1, NES_JOYPAD);
 
     int skipFrames = 0;
 
     while (true)
     {
-        uint32_t joy1 = rg_input_read_player(0);
-        uint32_t joy2 = rg_input_read_player(1);
+        uint32_t joystick = rg_input_read_gamepad();
 
-        if ((joy1 | joy2) & (RG_KEY_MENU|RG_KEY_OPTION))
+        if (joystick & (RG_KEY_MENU|RG_KEY_OPTION))
         {
-            if ((joy1 | joy2) & RG_KEY_MENU)
+            if (joystick & RG_KEY_MENU)
                 rg_gui_game_menu();
             else
                 rg_gui_options_menu();
@@ -276,25 +274,16 @@ void nes_main(void)
 
         int64_t startTime = rg_system_timer();
         bool drawFrame = !skipFrames && !nsfPlayer;
-        int buttons1 = 0, buttons2 = 0;
+        int buttons = 0;
 
-        if (joy1 & RG_KEY_START)  buttons1 |= NES_PAD_START;
-        if (joy1 & RG_KEY_SELECT) buttons1 |= NES_PAD_SELECT;
-        if (joy1 & RG_KEY_UP)     buttons1 |= NES_PAD_UP;
-        if (joy1 & RG_KEY_RIGHT)  buttons1 |= NES_PAD_RIGHT;
-        if (joy1 & RG_KEY_DOWN)   buttons1 |= NES_PAD_DOWN;
-        if (joy1 & RG_KEY_LEFT)   buttons1 |= NES_PAD_LEFT;
-        if (joy1 & RG_KEY_A)      buttons1 |= NES_PAD_A;
-        if (joy1 & RG_KEY_B)      buttons1 |= NES_PAD_B;
-
-        if (joy2 & RG_KEY_START)  buttons2 |= NES_PAD_START;
-        if (joy2 & RG_KEY_SELECT) buttons2 |= NES_PAD_SELECT;
-        if (joy2 & RG_KEY_UP)     buttons2 |= NES_PAD_UP;
-        if (joy2 & RG_KEY_RIGHT)  buttons2 |= NES_PAD_RIGHT;
-        if (joy2 & RG_KEY_DOWN)   buttons2 |= NES_PAD_DOWN;
-        if (joy2 & RG_KEY_LEFT)   buttons2 |= NES_PAD_LEFT;
-        if (joy2 & RG_KEY_A)      buttons2 |= NES_PAD_A;
-        if (joy2 & RG_KEY_B)      buttons2 |= NES_PAD_B;
+        if (joystick & RG_KEY_START)  buttons |= NES_PAD_START;
+        if (joystick & RG_KEY_SELECT) buttons |= NES_PAD_SELECT;
+        if (joystick & RG_KEY_UP)     buttons |= NES_PAD_UP;
+        if (joystick & RG_KEY_RIGHT)  buttons |= NES_PAD_RIGHT;
+        if (joystick & RG_KEY_DOWN)   buttons |= NES_PAD_DOWN;
+        if (joystick & RG_KEY_LEFT)   buttons |= NES_PAD_LEFT;
+        if (joystick & RG_KEY_A)      buttons |= NES_PAD_A;
+        if (joystick & RG_KEY_B)      buttons |= NES_PAD_B;
 
         if (drawFrame)
         {
@@ -302,8 +291,7 @@ void nes_main(void)
             nes_setvidbuf(currentUpdate->data);
         }
 
-        input_update(0, buttons1);
-        input_update(1, buttons2);
+        input_update(0, buttons);
         nes_emulate(drawFrame);
 
         // Tick before submitting audio/syncing

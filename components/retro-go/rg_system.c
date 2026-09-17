@@ -19,6 +19,7 @@
 #include <esp_timer.h>
 #include <esp_sleep.h>
 #include <driver/gpio.h>
+#include <nvs_flash.h>
 #else
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_mutex.h>
@@ -439,6 +440,13 @@ rg_app_t *rg_system_init(int sampleRate, const rg_handlers_t *handlers, void *_u
     platform_init();
 
 #if defined(ESP_PLATFORM)
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
     esp_reset_reason_t r_reason = esp_reset_reason();
     showCrashDialog = (r_reason == ESP_RST_PANIC); // || r_reason == ESP_RST_TASK_WDT ||
                        // r_reason == ESP_RST_INT_WDT || r_reason == ESP_RST_WDT);

@@ -49,18 +49,24 @@ static inline int es8311_rd(uint8_t reg)
 // Compute clock dividers for given sample_rate assuming MCLK = 256 * sample_rate
 static inline bool es8311_config_clock(int sample_rate)
 {
+    if (sample_rate <= 0)
+        sample_rate = 44100;
+
+    // ESP32 I2S output: MCLK = 256 * sample_rate, BCLK = 64 * sample_rate (32 bits * 2ch or 16 bits * 2ch with divider)
+    // LRCK = sample_rate
+    // In slave mode, ES8311 expects BCLK divider = MCLK / BCLK = 256 / 32 = 8 (register value = 8 - 1 = 7)
+    // and LRCK divider = 32 * 2 = 64 BCLK ticks per frame.
     uint8_t pre = 0x00;    // REG02: pre_div=1, pre_multi=1
     uint8_t adc_osr = 0x00;
     uint8_t dac_osr = 0x00;
     uint8_t clk_div = 0x00; // REG05: adc_div=1, dac_div=1
-    uint8_t bclk_div;       // REG06
-    uint16_t lrck;          // REG07/08
+    uint8_t bclk_div = 8 - 1; // REG06: div by 8
+    uint16_t lrck = 64;       // REG07/08: 64 BCLKs per LRCK
 
-    // MCLK = 256*fs (configured by ESP32 I2S MCLK output)
-    // BCLK = 32*fs (16bit * 2ch), lrck = fs
-    // bclk_div = 256/32 = 8
-    bclk_div = 8 - 1; // = 7
-    lrck = 64;         // BCLK ticks per LRCK period = 32*2 = 64
+    if (sample_rate < 24000)
+    {
+        dac_osr = 0x01;
+    }
 
     es8311_wr(ES8311_REG_CLK_PRE, pre);
     es8311_wr(ES8311_REG_ADC_OSR, adc_osr);

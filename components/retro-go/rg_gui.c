@@ -1988,9 +1988,6 @@ static rg_gui_event_t wifi_enable_cb(rg_gui_option_t *option, rg_gui_event_t eve
         int slot = rg_settings_get_number(NS_WIFI, SETTING_WIFI_SLOT, 0);
         if (slot < 0)
             slot = 0;
-        rg_settings_set_boolean(NS_WIFI, SETTING_WIFI_ENABLE, enable);
-        rg_settings_set_number(NS_WIFI, SETTING_WIFI_SLOT, slot);
-        rg_settings_commit();
 
         rg_input_wait_for_key(RG_KEY_ALL, false, 300);
         wifi_toggle_interactive(enable, slot);
@@ -1998,6 +1995,7 @@ static rg_gui_event_t wifi_enable_cb(rg_gui_option_t *option, rg_gui_event_t eve
 
         bool connected = (rg_network_get_info().state > RG_NETWORK_DISCONNECTED);
         rg_settings_set_boolean(NS_WIFI, SETTING_WIFI_ENABLE, connected);
+        rg_settings_set_number(NS_WIFI, SETTING_WIFI_SLOT, slot);
         rg_settings_commit();
 
         return RG_DIALOG_REDRAW;

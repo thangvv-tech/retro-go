@@ -60,12 +60,7 @@ static void network_event_handler(void* arg, esp_event_base_t event_base, int32_
         }
         else if (event_id == WIFI_EVENT_STA_START)
         {
-            if (wifi_user_started && wifi_config.ssid[0] && network_state != RG_NETWORK_CONNECTING && network_state != RG_NETWORK_CONNECTED)
-            {
-                network_state = RG_NETWORK_CONNECTING;
-                RG_LOGI("Connecting to '%s' (channel: %d)...", wifi_config.ssid, wifi_config.channel);
-                esp_wifi_connect();
-            }
+            RG_LOGD("WiFi STA started.");
         }
         else if (event_id == WIFI_EVENT_STA_CONNECTED)
         {
@@ -115,6 +110,14 @@ static void network_event_handler(void* arg, esp_event_base_t event_base, int32_
             if (wifi_user_started)
             {
                 network_state = RG_NETWORK_CONNECTED;
+                #if defined(RG_GAMEPAD_USE_ESPNOW)
+                // In APSTA mode the driver may have overridden the AP channel to match STA.
+                // Re-read the actual channel and notify the gamepad so it stays in sync.
+                uint8_t actual_chan = 0;
+                wifi_second_chan_t second;
+                if (esp_wifi_get_channel(&actual_chan, &second) == ESP_OK && actual_chan > 0)
+                    rg_input_espnow_notify_channel_switch(actual_chan);
+                #endif
                 rg_network_t info = rg_network_get_info();
                 RG_LOGI("Access point started! IP: %s", info.ip_addr);
                 rg_system_event(RG_EVENT_NETWORK_CONNECTED, NULL);
@@ -317,7 +320,11 @@ bool rg_network_wifi_start(void)
         }
         esp_wifi_set_ps(WIFI_PS_NONE);
         RG_LOGI("Connecting to '%s' (channel: %d)...", wifi_config.ssid, wifi_config.channel);
-        esp_wifi_connect();
+        err = esp_wifi_connect();
+        if (err != ESP_OK)
+        {
+            RG_LOGE("esp_wifi_connect = 0x%x\n", err);
+        }
     }
     return true;
 fail:
@@ -343,10 +350,11 @@ void rg_network_wifi_stop(void)
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_ps(WIFI_PS_NONE);
+    // Keep wifi_config intact: ESP-NOW holds WiFi up, start() may reconnect immediately
     #else
     esp_wifi_stop();
-    #endif
     memset(&wifi_config, 0, sizeof(wifi_config));
+    #endif
     netif = NULL;
     rg_system_event(RG_EVENT_NETWORK_DISCONNECTED, NULL);
     RG_LOGI("Wifi stopped.");
@@ -437,10 +445,6 @@ bool rg_network_init(void)
         esp_netif_set_hostname(netif_sta, RG_TARGET_NAME);
     if (netif_ap)
         esp_netif_set_hostname(netif_ap, RG_TARGET_NAME);
-
-    // Wifi may use nvs for calibration data
-    if (nvs_flash_init() != ESP_OK && nvs_flash_erase() == ESP_OK)
-        nvs_flash_init();
 
     // Initialize wifi driver (it won't enable the radio yet)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();

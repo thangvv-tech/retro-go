@@ -167,9 +167,7 @@ void sms_main(void)
     while (true)
     {
         const int64_t startTime = rg_system_timer();
-        uint32_t joy1 = rg_input_read_player(0);
-        uint32_t joy2 = rg_input_read_player(1);
-        uint32_t joystick = joy1 | joy2;
+        uint32_t joystick = rg_input_read_gamepad();
         bool drawFrame = !skipFrames;
         bool slowFrame = false;
 
@@ -186,19 +184,12 @@ void sms_main(void)
         input.pad[1] = 0x00;
         input.system = 0x00;
 
-        if (joy1 & RG_KEY_UP)    input.pad[0] |= INPUT_UP;
-        if (joy1 & RG_KEY_DOWN)  input.pad[0] |= INPUT_DOWN;
-        if (joy1 & RG_KEY_LEFT)  input.pad[0] |= INPUT_LEFT;
-        if (joy1 & RG_KEY_RIGHT) input.pad[0] |= INPUT_RIGHT;
-        if (joy1 & RG_KEY_A)     input.pad[0] |= INPUT_BUTTON2;
-        if (joy1 & RG_KEY_B)     input.pad[0] |= INPUT_BUTTON1;
-
-        if (joy2 & RG_KEY_UP)    input.pad[1] |= INPUT_UP;
-        if (joy2 & RG_KEY_DOWN)  input.pad[1] |= INPUT_DOWN;
-        if (joy2 & RG_KEY_LEFT)  input.pad[1] |= INPUT_LEFT;
-        if (joy2 & RG_KEY_RIGHT) input.pad[1] |= INPUT_RIGHT;
-        if (joy2 & RG_KEY_A)     input.pad[1] |= INPUT_BUTTON2;
-        if (joy2 & RG_KEY_B)     input.pad[1] |= INPUT_BUTTON1;
+        if (joystick & RG_KEY_UP)    input.pad[0] |= INPUT_UP;
+        if (joystick & RG_KEY_DOWN)  input.pad[0] |= INPUT_DOWN;
+        if (joystick & RG_KEY_LEFT)  input.pad[0] |= INPUT_LEFT;
+        if (joystick & RG_KEY_RIGHT) input.pad[0] |= INPUT_RIGHT;
+        if (joystick & RG_KEY_A)     input.pad[0] |= INPUT_BUTTON2;
+        if (joystick & RG_KEY_B)     input.pad[0] |= INPUT_BUTTON1;
 
         if (IS_SMS)
         {

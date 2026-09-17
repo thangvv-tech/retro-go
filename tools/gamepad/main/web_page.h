@@ -620,7 +620,6 @@ static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
         <span id="powerText">DISCONNECTED</span>
       </div>
       <div class="logo-text">RETRO-GO</div>
-      <button class="player-pill" id="playerTag" onclick="cyclePlayerId()" title="Bấm để đổi Player 1 / Player 2">PLAYER 1</button>
       <button class="pair-pill" id="pairBtn" onclick="triggerPairing()" title="Ghép đôi lại / Quét kênh">PAIR</button>
       <button class="fs-btn" onclick="toggleFullScreen()" title="Fullscreen">&#x26F6;</button>
     </div>
@@ -714,16 +713,7 @@ static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
 
   let activeMask = 0;
   let ws = null;
-  let currentPlayerId = 0;
   let currentIsPaired = false;
-
-  function cyclePlayerId() {
-    const nextPlayer = (currentPlayerId === 0) ? 1 : 0;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(new Uint8Array([0xAA, 0x01, nextPlayer]));
-      if (navigator.vibrate) navigator.vibrate(20);
-    }
-  }
 
   function triggerPairing() {
     if (confirm('Quét kênh và ghép đôi lại với máy Retro-Go?')) {
@@ -751,11 +741,8 @@ static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
         const d = new Uint8Array(e.data);
         if (d.length >= 5 && d[0] === 0xBB) {
           currentIsPaired = (d[1] === 1);
-          currentPlayerId = d[2];
           const ch = d[3];
           const chLocked = (d[4] === 1);
-
-          document.getElementById('playerTag').textContent = 'PLAYER ' + (currentPlayerId + 1);
 
           const pText = document.getElementById('powerText');
           const pairBtn = document.getElementById('pairBtn');

@@ -318,63 +318,37 @@ static inline uint16_t read_buttons_raw(void)
     return keys;
 }
 
-static uint8_t init_player_id(void)
+static void init_gamepad_pairing(void)
 {
-    nvs_handle_t handle;
-    uint8_t id = 0;
-    esp_err_t err = nvs_open("gamepad", NVS_READWRITE, &handle);
-    if (err == ESP_OK) {
-        // Allow pull-up stabilization and user button hold to register reliably
-        vTaskDelay(pdMS_TO_TICKS(20));
-        uint16_t boot_keys = read_buttons_raw();
+    // Allow pull-up stabilization and user button hold to register reliably
+    vTaskDelay(pdMS_TO_TICKS(20));
+    uint16_t boot_keys = read_buttons_raw();
 
-        // Boot combo: SELECT + START held together clears bonding bond
-        if ((boot_keys & (RG_KEY_SELECT | RG_KEY_START)) == (RG_KEY_SELECT | RG_KEY_START)) {
-            clear_bonding_nvs();
-            ESP_LOGW(TAG, "Pairing bond cleared! Entering discovery pairing mode.");
-        }
+    // Boot combo: SELECT + START held together clears bonding bond
+    if ((boot_keys & (RG_KEY_SELECT | RG_KEY_START)) == (RG_KEY_SELECT | RG_KEY_START)) {
+        clear_bonding_nvs();
+        ESP_LOGW(TAG, "Pairing bond cleared! Entering discovery pairing mode.");
+    }
 
-        if (boot_keys & RG_KEY_B) {
-            id = 1; // Button B held at boot -> Player 2
-            nvs_set_u8(handle, "player_id", id);
-            nvs_commit(handle);
-            ESP_LOGI(TAG, "Configured as Player 2 (B held at boot)");
-        } else if (boot_keys & RG_KEY_A) {
-            id = 0; // Button A held at boot -> Player 1
-            nvs_set_u8(handle, "player_id", id);
-            nvs_commit(handle);
-            ESP_LOGI(TAG, "Configured as Player 1 (A held at boot)");
-        } else {
-            if (nvs_get_u8(handle, "player_id", &id) != ESP_OK) {
-                id = 0;
-            }
-            ESP_LOGI(TAG, "Active Player ID: %d (Player %d)", id, id + 1);
-        }
-        nvs_close(handle);
+    active_player_id = 0;
 
-        if (boot_keys & (RG_KEY_A | RG_KEY_B | RG_KEY_SELECT | RG_KEY_START)) {
-            int wait_count = 0;
-            while ((read_buttons_raw() & (RG_KEY_A | RG_KEY_B | RG_KEY_SELECT | RG_KEY_START)) && wait_count++ < 200) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
+    if (boot_keys & (RG_KEY_SELECT | RG_KEY_START)) {
+        int wait_count = 0;
+        while ((read_buttons_raw() & (RG_KEY_SELECT | RG_KEY_START)) && wait_count++ < 200) {
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
-    active_player_id = id;
-    return id;
 }
 
-static void indicate_player_led(uint8_t player_id)
+static void indicate_ready_led(void)
 {
 #ifdef PIN_LED
-    // Onboard status LED: Blink 1x for Player 1, 2x for Player 2
+    // Onboard status LED: Blink 1x on boot
     gpio_set_direction(PIN_LED, GPIO_MODE_OUTPUT);
-    int blinks = (player_id == 0) ? 1 : 2;
-    for (int i = 0; i < blinks; i++) {
-        gpio_set_level(PIN_LED, 0); // Active LOW on most ESP boards
-        vTaskDelay(pdMS_TO_TICKS(150));
-        gpio_set_level(PIN_LED, 1);
-        vTaskDelay(pdMS_TO_TICKS(150));
-    }
+    gpio_set_level(PIN_LED, 0); // Active LOW on most ESP boards
+    vTaskDelay(pdMS_TO_TICKS(150));
+    gpio_set_level(PIN_LED, 1);
+    vTaskDelay(pdMS_TO_TICKS(150));
 #if defined(CONFIG_IDF_TARGET_ESP32C3)
     // ESP32-C3 SuperMini: PIN_LED is shared with PIN_L (GPIO 8). Restore to input with pullup.
     gpio_set_direction(PIN_LED, GPIO_MODE_INPUT);
@@ -408,21 +382,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
     if (ws_pkt.len >= 2) {
         if (buf[0] == 0xAA) {
             // Control Command from Web UI
-            if (buf[1] == 0x01 && ws_pkt.len >= 3) {
-                // Switch Player ID
-                uint8_t new_id = buf[2] & 1;
-                if (new_id != active_player_id) {
-                    active_player_id = new_id;
-                    nvs_handle_t h;
-                    if (nvs_open("gamepad", NVS_READWRITE, &h) == ESP_OK) {
-                        nvs_set_u8(h, "player_id", active_player_id);
-                        nvs_commit(h);
-                        nvs_close(h);
-                    }
-                    indicate_player_led(active_player_id);
-                    ESP_LOGI(TAG, "Web switched Active Player ID to %d", active_player_id + 1);
-                }
-            } else if (buf[1] == 0x02) {
+            if (buf[1] == 0x02) {
                 // Trigger Re-Pairing
                 clear_bonding_nvs();
                 channel_locked = false;
@@ -459,17 +419,6 @@ static esp_err_t ws_handler(httpd_req_t *req)
 static esp_err_t http_get_index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    const char *tag_target = ">PLAYER 1</button>";
-    const char *found = strstr(INDEX_HTML, tag_target);
-    if (found && active_player_id == 1) {
-        size_t prefix_len = (found - INDEX_HTML) + strlen(">PLAYER ");
-        httpd_resp_send_chunk(req, INDEX_HTML, prefix_len);
-        httpd_resp_send_chunk(req, "2", 1);
-        const char *suffix = found + strlen(">PLAYER 1");
-        httpd_resp_send_chunk(req, suffix, HTTPD_RESP_USE_STRLEN);
-        httpd_resp_send_chunk(req, NULL, 0); // End chunked response
-        return ESP_OK;
-    }
     httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -565,19 +514,19 @@ static void wifi_espnow_init(uint8_t player_id)
 
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 
-    ESP_LOGI(TAG, "ESP-NOW Gamepad TX ready on Channel %d (Player %d). Paired: %s",
-             current_channel, active_player_id + 1, is_paired ? "YES" : "NO (Discovery Mode)");
+    ESP_LOGI(TAG, "ESP-NOW Gamepad TX ready on Channel %d. Paired: %s",
+             current_channel, is_paired ? "YES" : "NO (Discovery Mode)");
 }
 
 void app_main(void)
 {
     buttons_init();
 
-    uint8_t player_id = init_player_id();
-    indicate_player_led(player_id);
+    init_gamepad_pairing();
+    indicate_ready_led();
     buttons_init(); // Re-arm GPIO as input with pull-up
 
-    wifi_espnow_init(active_player_id);
+    wifi_espnow_init(0);
     start_webserver();
 
     uint16_t debounced_gpio_state = 0;

@@ -48,6 +48,8 @@ static uint32_t gamepad_mapped = 0;
 #include <esp_netif.h>
 #include <esp_event.h>
 #include <nvs_flash.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 
 #ifndef RG_GAMEPAD_WIFI_CHANNEL
 #define RG_GAMEPAD_WIFI_CHANNEL 1
@@ -75,27 +77,66 @@ typedef struct __attribute__((packed)) {
     uint8_t  reserved;       // Alignment padding
 } rg_espnow_gamepad_packet_t;
 
-static volatile uint32_t espnow_player_state[2] = {0, 0};
-static int64_t espnow_last_packet_time[2] = {0, 0};
-static bool espnow_player_connected[2] = {false, false};
-static uint8_t espnow_player_mac[2][6];
-static bool espnow_player_bound[2] = {false, false};
-static uint8_t espnow_bonded_mac[2][6] = {{0}, {0}};
-static bool espnow_has_bonded_mac[2] = {false, false};
+static uint32_t espnow_gamepad_state = 0;
+static int64_t espnow_last_packet_time = 0;
+static bool espnow_gamepad_connected = false;
+static uint8_t espnow_gamepad_mac[6];
+static bool espnow_gamepad_bound = false;
+static uint8_t espnow_bonded_mac[6] = {0};
+static bool espnow_has_bonded_mac = false;
 static uint8_t console_self_mac[6] = {0};
 static uint8_t espnow_current_channel = RG_GAMEPAD_WIFI_CHANNEL;
 static const uint8_t espnow_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Protects espnow_gamepad_state written from WiFi task, read from emulator task (dual-core)
+static portMUX_TYPE espnow_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static void espnow_save_bonded_mac(uint8_t player, const uint8_t *mac)
+// Deferred worker: recv_cb only enqueues here; actual NVS writes and esp_now_send happen in worker task
+typedef enum { ESPNOW_EV_ACK, ESPNOW_EV_PAIR_ACK, ESPNOW_EV_NVS_SAVE } espnow_ev_type_t;
+typedef struct {
+    espnow_ev_type_t type;
+    rg_espnow_gamepad_packet_t pkt;   // packet to send (ACK / PAIR_ACK)
+    uint8_t mac[6];
+} espnow_ev_t;
+static QueueHandle_t espnow_ev_queue;
+
+static void espnow_worker_task(void *arg)
 {
+    espnow_ev_t ev;
     nvs_handle_t h;
-    if (nvs_open("retro-go", NVS_READWRITE, &h) == ESP_OK)
+    while (true)
     {
-        const char *key = (player == 0) ? "gp_mac_p1" : "gp_mac_p2";
-        nvs_set_blob(h, key, mac, 6);
-        nvs_commit(h);
-        nvs_close(h);
+        if (xQueueReceive(espnow_ev_queue, &ev, portMAX_DELAY) != pdTRUE)
+            continue;
+        switch (ev.type)
+        {
+        case ESPNOW_EV_ACK:
+        case ESPNOW_EV_PAIR_ACK:
+            esp_now_send(espnow_broadcast_mac, (const uint8_t *)&ev.pkt, sizeof(ev.pkt));
+            break;
+        case ESPNOW_EV_NVS_SAVE:
+            if (nvs_open("retro-go", NVS_READWRITE, &h) == ESP_OK)
+            {
+                nvs_set_blob(h, "gp_mac", ev.mac, 6);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            break;
+        }
     }
+}
+
+static void espnow_enqueue_send(espnow_ev_type_t type, const rg_espnow_gamepad_packet_t *pkt)
+{
+    espnow_ev_t ev = { .type = type };
+    ev.pkt = *pkt;
+    xQueueSend(espnow_ev_queue, &ev, 0); // non-blocking; drop if queue full
+}
+
+static void espnow_enqueue_nvs_save(const uint8_t *mac)
+{
+    espnow_ev_t ev = { .type = ESPNOW_EV_NVS_SAVE };
+    memcpy(ev.mac, mac, 6);
+    xQueueSend(espnow_ev_queue, &ev, 0);
 }
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
@@ -111,9 +152,8 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
 
     const rg_espnow_gamepad_packet_t *packet = (const rg_espnow_gamepad_packet_t *)data;
     if (packet->magic != RG_ESPNOW_GAMEPAD_MAGIC)
-        return; // Discard packets without Retro-Go magic header
+        return;
 
-    // Discard console-side loopbacks and ACK/broadcast commands
     if (packet->buttons == RG_ESPNOW_CMD_ACK ||
         packet->buttons == RG_ESPNOW_CMD_PAIR_ACK ||
         packet->buttons == RG_ESPNOW_CMD_CHAN_SWITCH)
@@ -121,129 +161,107 @@ static void espnow_recv_cb(const uint8_t *src_mac, const uint8_t *data, int data
 
 #if RG_GAMEPAD_SYSTEM_ID > 0
     if (packet->system_id != RG_GAMEPAD_SYSTEM_ID)
-        return; // Discard packets destined for a different console in the room
+        return;
 #endif
 
-    uint8_t player = packet->player_id & 1; // 0 = Player 1, 1 = Player 2
     int64_t now = rg_system_timer();
 
-    // 1. Explicit pairing request from gamepad
+    // 1. Explicit pairing request
     if (packet->buttons == RG_ESPNOW_CMD_PAIR_REQ)
     {
-        // Prevent hijacking active player slot mid-game:
-        // If slot is actively held by another controller (< 2s idle), reject foreign pairing request
-        if (espnow_has_bonded_mac[player] && espnow_player_connected[player] &&
-            (now - espnow_last_packet_time[player] < 2000000) &&
-            memcmp(espnow_bonded_mac[player], src_mac, 6) != 0)
-        {
+        if (espnow_has_bonded_mac && espnow_gamepad_connected &&
+            (now - espnow_last_packet_time < 2000000) &&
+            memcmp(espnow_bonded_mac, src_mac, 6) != 0)
             return;
-        }
 
-        memcpy(espnow_player_mac[player], src_mac, 6);
-        memcpy(espnow_bonded_mac[player], src_mac, 6);
-        espnow_has_bonded_mac[player] = true;
-        espnow_player_bound[player] = true;
-        espnow_save_bonded_mac(player, src_mac);
+        memcpy(espnow_gamepad_mac, src_mac, 6);
+        memcpy(espnow_bonded_mac, src_mac, 6);
+        espnow_has_bonded_mac = true;
+        espnow_gamepad_bound = true;
+        // Defer NVS write to worker — never block in recv callback
+        espnow_enqueue_nvs_save(src_mac);
 
-        RG_LOGI("ESP-NOW: Pairing accepted for Player %d from %02X:%02X:%02X:%02X:%02X:%02X",
-                player + 1, src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+        RG_LOGI("ESP-NOW: Pairing accepted from %02X:%02X:%02X:%02X:%02X:%02X",
+                src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
 
         rg_espnow_gamepad_packet_t pair_ack = {
             .magic = RG_ESPNOW_GAMEPAD_MAGIC,
             .system_id = RG_GAMEPAD_SYSTEM_ID,
             .buttons = RG_ESPNOW_CMD_PAIR_ACK,
             .seq = packet->seq,
-            .player_id = player,
+            .player_id = 0,
             .channel = espnow_current_channel,
             .reserved = 0,
         };
         memcpy(pair_ack.console_mac, console_self_mac, 6);
-        esp_now_send(espnow_broadcast_mac, (const uint8_t *)&pair_ack, sizeof(pair_ack));
+        // Defer send to worker — esp_now_send must not be called from recv callback
+        espnow_enqueue_send(ESPNOW_EV_PAIR_ACK, &pair_ack);
         return;
     }
 
-    // 2. Normal button packets: Whitelist / Bonding check
-    if (espnow_has_bonded_mac[player])
+    // 2. Normal button packets: bonding check
+    if (espnow_has_bonded_mac)
     {
-        if (memcmp(espnow_bonded_mac[player], src_mac, 6) != 0)
-        {
-            // Reject packet from foreign gamepad on bonded slot
+        if (memcmp(espnow_bonded_mac, src_mac, 6) != 0)
             return;
-        }
     }
     else
     {
-        // Slot is unbonded: auto-bond first controller that connects
-        memcpy(espnow_player_mac[player], src_mac, 6);
-        memcpy(espnow_bonded_mac[player], src_mac, 6);
-        espnow_has_bonded_mac[player] = true;
-        espnow_player_bound[player] = true;
-        espnow_save_bonded_mac(player, src_mac);
-        RG_LOGI("ESP-NOW: Auto-bonded Player %d to MAC %02X:%02X:%02X:%02X:%02X:%02X",
-                player + 1, src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+        memcpy(espnow_gamepad_mac, src_mac, 6);
+        memcpy(espnow_bonded_mac, src_mac, 6);
+        espnow_has_bonded_mac = true;
+        espnow_gamepad_bound = true;
+        espnow_enqueue_nvs_save(src_mac);
+        RG_LOGI("ESP-NOW: Auto-bonded to MAC %02X:%02X:%02X:%02X:%02X:%02X",
+                src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
     }
 
     uint8_t active_radio_channel = espnow_current_channel;
     wifi_second_chan_t second;
     if (esp_wifi_get_channel(&active_radio_channel, &second) == ESP_OK && active_radio_channel > 0)
-    {
         espnow_current_channel = active_radio_channel;
-    }
 
-    // Send ACK back with console MAC and current channel hint
+    // Defer ACK send to worker
     rg_espnow_gamepad_packet_t ack = {
         .magic = RG_ESPNOW_GAMEPAD_MAGIC,
         .system_id = packet->system_id,
         .buttons = RG_ESPNOW_CMD_ACK,
         .seq = packet->seq,
-        .player_id = player,
+        .player_id = 0,
         .channel = espnow_current_channel,
         .reserved = 0,
     };
     memcpy(ack.console_mac, console_self_mac, 6);
-    esp_now_send(espnow_broadcast_mac, (const uint8_t *)&ack, sizeof(ack));
+    espnow_enqueue_send(ESPNOW_EV_ACK, &ack);
 
-    espnow_player_state[player] = (uint32_t)packet->buttons;
-    espnow_last_packet_time[player] = now;
-    if (!espnow_player_connected[player])
+    portENTER_CRITICAL(&espnow_mux);
+    espnow_gamepad_state = (uint32_t)packet->buttons;
+    espnow_last_packet_time = now;
+    portEXIT_CRITICAL(&espnow_mux);
+
+    if (!espnow_gamepad_connected)
     {
-        espnow_player_connected[player] = true;
-        RG_LOGI("ESP-NOW: Gamepad Player %d connected.", player + 1);
+        espnow_gamepad_connected = true;
+        RG_LOGI("ESP-NOW: Wireless gamepad connected.");
     }
 }
 
 static void espnow_gamepad_init(void)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
-
-    // Load bonded MACs from NVS
+    // Load bonded MAC from NVS (check "gp_mac", fallback to legacy "gp_mac_p1")
     nvs_handle_t h;
     if (nvs_open("retro-go", NVS_READONLY, &h) == ESP_OK)
     {
         size_t len = 6;
-        if (nvs_get_blob(h, "gp_mac_p1", espnow_bonded_mac[0], &len) == ESP_OK && len == 6)
+        if ((nvs_get_blob(h, "gp_mac", espnow_bonded_mac, &len) == ESP_OK && len == 6) ||
+            (nvs_get_blob(h, "gp_mac_p1", espnow_bonded_mac, &len) == ESP_OK && len == 6))
         {
-            espnow_has_bonded_mac[0] = true;
-            memcpy(espnow_player_mac[0], espnow_bonded_mac[0], 6);
-            espnow_player_bound[0] = true;
-            RG_LOGI("ESP-NOW: Loaded bonded Player 1 MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                    espnow_bonded_mac[0][0], espnow_bonded_mac[0][1], espnow_bonded_mac[0][2],
-                    espnow_bonded_mac[0][3], espnow_bonded_mac[0][4], espnow_bonded_mac[0][5]);
-        }
-        len = 6;
-        if (nvs_get_blob(h, "gp_mac_p2", espnow_bonded_mac[1], &len) == ESP_OK && len == 6)
-        {
-            espnow_has_bonded_mac[1] = true;
-            memcpy(espnow_player_mac[1], espnow_bonded_mac[1], 6);
-            espnow_player_bound[1] = true;
-            RG_LOGI("ESP-NOW: Loaded bonded Player 2 MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                    espnow_bonded_mac[1][0], espnow_bonded_mac[1][1], espnow_bonded_mac[1][2],
-                    espnow_bonded_mac[1][3], espnow_bonded_mac[1][4], espnow_bonded_mac[1][5]);
+            espnow_has_bonded_mac = true;
+            memcpy(espnow_gamepad_mac, espnow_bonded_mac, 6);
+            espnow_gamepad_bound = true;
+            RG_LOGI("ESP-NOW: Loaded bonded gamepad MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                    espnow_bonded_mac[0], espnow_bonded_mac[1], espnow_bonded_mac[2],
+                    espnow_bonded_mac[3], espnow_bonded_mac[4], espnow_bonded_mac[5]);
         }
         nvs_close(h);
     }
@@ -270,9 +288,13 @@ static void espnow_gamepad_init(void)
     }
 
     esp_wifi_get_mac(WIFI_IF_STA, console_self_mac);
-    esp_wifi_set_ps(WIFI_PS_NONE); // Disable power-save: radio always listening for packets
+    esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_set_max_tx_power(78);
     esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
+
+    // Worker task: handles deferred NVS writes and esp_now_send from recv callback
+    espnow_ev_queue = xQueueCreate(16, sizeof(espnow_ev_t));
+    xTaskCreate(espnow_worker_task, "espnow_wk", 3072, NULL, 5, NULL);
 
     if (esp_now_init() == ESP_OK)
     {
@@ -299,6 +321,50 @@ static void espnow_gamepad_init(void)
                        RG_KEY_L | RG_KEY_R);
 }
 
+typedef struct {
+    uint8_t old_chan;
+    uint8_t new_chan;
+    rg_espnow_gamepad_packet_t pkt;
+} espnow_chan_switch_args_t;
+
+static void espnow_chan_switch_task(void *arg)
+{
+    espnow_chan_switch_args_t *a = (espnow_chan_switch_args_t *)arg;
+
+    uint8_t current_radio_chan = 0;
+    wifi_second_chan_t second_chan;
+    esp_wifi_get_channel(&current_radio_chan, &second_chan);
+
+    // 1. Transmit on old_chan so gamepad receives notice immediately.
+    // Skip promiscuous hop if WiFi is actively connected — disrupts DHCP/data path.
+    wifi_mode_t wifi_mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&wifi_mode);
+    bool wifi_connected = (wifi_mode == WIFI_MODE_STA || wifi_mode == WIFI_MODE_APSTA);
+    if (!wifi_connected && a->old_chan >= 1 && a->old_chan <= 13 && current_radio_chan != a->old_chan)
+    {
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(a->old_chan, WIFI_SECOND_CHAN_NONE);
+        for (int i = 0; i < 8; i++)
+        {
+            esp_now_send(espnow_broadcast_mac, (const uint8_t *)&a->pkt, sizeof(a->pkt));
+            vTaskDelay(1);
+        }
+        esp_wifi_set_channel(current_radio_chan, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous(false);
+    }
+
+    // 2. Also transmit on new_chan
+    for (int i = 0; i < 8; i++)
+    {
+        esp_now_send(espnow_broadcast_mac, (const uint8_t *)&a->pkt, sizeof(a->pkt));
+        vTaskDelay(1);
+    }
+
+    RG_LOGI("ESP-NOW: Broadcasted channel switch notice (%d -> %d).", a->old_chan, a->new_chan);
+    free(a);
+    vTaskDelete(NULL);
+}
+
 void rg_input_espnow_notify_channel_switch(uint8_t new_channel)
 {
     if (new_channel < 1 || new_channel > 13)
@@ -310,7 +376,16 @@ void rg_input_espnow_notify_channel_switch(uint8_t new_channel)
     if (old_chan == new_channel)
         return;
 
-    rg_espnow_gamepad_packet_t switch_pkt = {
+    espnow_chan_switch_args_t *args = malloc(sizeof(espnow_chan_switch_args_t));
+    if (!args)
+    {
+        RG_LOGW("ESP-NOW: channel switch notify OOM.");
+        return;
+    }
+
+    args->old_chan = old_chan;
+    args->new_chan = new_channel;
+    args->pkt = (rg_espnow_gamepad_packet_t){
         .magic = RG_ESPNOW_GAMEPAD_MAGIC,
         .system_id = RG_GAMEPAD_SYSTEM_ID,
         .buttons = RG_ESPNOW_CMD_CHAN_SWITCH,
@@ -319,34 +394,14 @@ void rg_input_espnow_notify_channel_switch(uint8_t new_channel)
         .channel = new_channel,
         .reserved = 0,
     };
-    memcpy(switch_pkt.console_mac, console_self_mac, 6);
+    memcpy(args->pkt.console_mac, console_self_mac, 6);
 
-    uint8_t current_radio_chan = 0;
-    wifi_second_chan_t second_chan;
-    esp_wifi_get_channel(&current_radio_chan, &second_chan);
-
-    // 1. Transmit directly on old_chan so gamepad receives notice immediately
-    if (old_chan >= 1 && old_chan <= 13 && current_radio_chan != old_chan)
+    // Run in background task to avoid blocking the event loop with busy-wait sends
+    if (xTaskCreate(espnow_chan_switch_task, "espnow_ch", 2048, args, 5, NULL) != pdPASS)
     {
-        esp_wifi_set_promiscuous(true);
-        esp_wifi_set_channel(old_chan, WIFI_SECOND_CHAN_NONE);
-        for (int i = 0; i < 8; i++)
-        {
-            esp_now_send(espnow_broadcast_mac, (const uint8_t *)&switch_pkt, sizeof(switch_pkt));
-            esp_rom_delay_us(500);
-        }
-        esp_wifi_set_channel(current_radio_chan, WIFI_SECOND_CHAN_NONE);
-        esp_wifi_set_promiscuous(false);
+        RG_LOGW("ESP-NOW: Failed to create channel switch task.");
+        free(args);
     }
-
-    // 2. Also transmit on current / new_channel
-    for (int i = 0; i < 8; i++)
-    {
-        esp_now_send(espnow_broadcast_mac, (const uint8_t *)&switch_pkt, sizeof(switch_pkt));
-        esp_rom_delay_us(500);
-    }
-
-    RG_LOGI("ESP-NOW: Broadcasted channel switch notice (%d -> %d).", old_chan, new_channel);
 }
 #endif
 static bool input_task_running = false;
@@ -690,65 +745,55 @@ void rg_input_deinit(void)
 
 bool rg_input_key_is_present(rg_key_t mask)
 {
-    return (gamepad_mapped & mask) == mask;
-}
-
-uint32_t rg_input_read_player(int player)
-{
-#ifdef RG_TARGET_SDL2
-    SDL_PumpEvents();
-#endif
-    uint32_t state = 0;
-    if (player == 0)
-    {
-        state = gamepad_state;
+    uint32_t mapped = gamepad_mapped;
 #if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
-        int64_t diff = rg_system_timer() - espnow_last_packet_time[0];
-        if (diff > 500000)
-        {
-            if (espnow_player_connected[0])
-            {
-                espnow_player_connected[0] = false;
-                RG_LOGI("ESP-NOW: Gamepad Player 1 disconnected.");
-            }
-            espnow_player_state[0] = 0;
-            if (diff > 1500000 && espnow_player_bound[0] && !espnow_has_bonded_mac[0])
-            {
-                espnow_player_bound[0] = false;
-                RG_LOGI("ESP-NOW: Player 1 slot released for new controllers.");
-            }
-        }
-        state |= espnow_player_state[0];
-#endif
-    }
-    else if (player == 1)
+    if (espnow_gamepad_connected)
     {
-#if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
-        int64_t diff = rg_system_timer() - espnow_last_packet_time[1];
-        if (diff > 500000)
-        {
-            if (espnow_player_connected[1])
-            {
-                espnow_player_connected[1] = false;
-                RG_LOGI("ESP-NOW: Gamepad Player 2 disconnected.");
-            }
-            espnow_player_state[1] = 0;
-            if (diff > 1500000 && espnow_player_bound[1] && !espnow_has_bonded_mac[1])
-            {
-                espnow_player_bound[1] = false;
-                RG_LOGI("ESP-NOW: Player 2 slot released for new controllers.");
-            }
-        }
-        state = espnow_player_state[1];
-#endif
+        mapped |= (RG_KEY_UP | RG_KEY_DOWN | RG_KEY_LEFT | RG_KEY_RIGHT |
+                   RG_KEY_A | RG_KEY_B | RG_KEY_START | RG_KEY_SELECT);
     }
-
-    return state;
+#endif
+    return (mapped & mask) == mask;
 }
 
 uint32_t rg_input_read_gamepad(void)
 {
-    return rg_input_read_player(0) | rg_input_read_player(1);
+#ifdef RG_TARGET_SDL2
+    SDL_PumpEvents();
+#endif
+    uint32_t state = gamepad_state;
+
+#if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
+    portENTER_CRITICAL(&espnow_mux);
+    int64_t last = espnow_last_packet_time;
+    uint32_t pstate = espnow_gamepad_state;
+    portEXIT_CRITICAL(&espnow_mux);
+
+    int64_t diff = rg_system_timer() - last;
+    if (diff > 500000)
+    {
+        if (espnow_gamepad_connected)
+        {
+            espnow_gamepad_connected = false;
+            RG_LOGI("ESP-NOW: Wireless gamepad disconnected.");
+        }
+        portENTER_CRITICAL(&espnow_mux);
+        espnow_gamepad_state = 0;
+        portEXIT_CRITICAL(&espnow_mux);
+        pstate = 0;
+        // Release bonding after 5s so a new controller can auto-bond
+        if (diff > 5000000 && espnow_gamepad_bound)
+        {
+            espnow_gamepad_bound = false;
+            espnow_has_bonded_mac = false;
+            memset(espnow_bonded_mac, 0, 6);
+            RG_LOGI("ESP-NOW: Gamepad slot released for new controllers.");
+        }
+    }
+    state |= pstate;
+#endif
+
+    return state;
 }
 
 bool rg_input_key_is_pressed(rg_key_t mask)

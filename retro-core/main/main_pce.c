@@ -104,10 +104,8 @@ void osd_vsync(void)
 
 void osd_input_read(uint8_t joypads[8])
 {
-    uint32_t joy1 = rg_input_read_player(0);
-    uint32_t joy2 = rg_input_read_player(1);
-    uint32_t joystick = joy1 | joy2;
-    uint32_t buttons1 = 0, buttons2 = 0;
+    uint32_t joystick = rg_input_read_gamepad();
+    uint32_t buttons = 0;
 
     if (joystick & (RG_KEY_MENU|RG_KEY_OPTION))
     {
@@ -119,26 +117,16 @@ void osd_input_read(uint8_t joypads[8])
         emulationPaused = false;
     }
 
-    if (joy1 & RG_KEY_LEFT)   buttons1 |= JOY_LEFT;
-    if (joy1 & RG_KEY_RIGHT)  buttons1 |= JOY_RIGHT;
-    if (joy1 & RG_KEY_UP)     buttons1 |= JOY_UP;
-    if (joy1 & RG_KEY_DOWN)   buttons1 |= JOY_DOWN;
-    if (joy1 & RG_KEY_A)      buttons1 |= JOY_A;
-    if (joy1 & RG_KEY_B)      buttons1 |= JOY_B;
-    if (joy1 & RG_KEY_START)  buttons1 |= JOY_RUN;
-    if (joy1 & RG_KEY_SELECT) buttons1 |= JOY_SELECT;
+    if (joystick & RG_KEY_LEFT)   buttons |= JOY_LEFT;
+    if (joystick & RG_KEY_RIGHT)  buttons |= JOY_RIGHT;
+    if (joystick & RG_KEY_UP)     buttons |= JOY_UP;
+    if (joystick & RG_KEY_DOWN)   buttons |= JOY_DOWN;
+    if (joystick & RG_KEY_A)      buttons |= JOY_A;
+    if (joystick & RG_KEY_B)      buttons |= JOY_B;
+    if (joystick & RG_KEY_START)  buttons |= JOY_RUN;
+    if (joystick & RG_KEY_SELECT) buttons |= JOY_SELECT;
 
-    if (joy2 & RG_KEY_LEFT)   buttons2 |= JOY_LEFT;
-    if (joy2 & RG_KEY_RIGHT)  buttons2 |= JOY_RIGHT;
-    if (joy2 & RG_KEY_UP)     buttons2 |= JOY_UP;
-    if (joy2 & RG_KEY_DOWN)   buttons2 |= JOY_DOWN;
-    if (joy2 & RG_KEY_A)      buttons2 |= JOY_A;
-    if (joy2 & RG_KEY_B)      buttons2 |= JOY_B;
-    if (joy2 & RG_KEY_START)  buttons2 |= JOY_RUN;
-    if (joy2 & RG_KEY_SELECT) buttons2 |= JOY_SELECT;
-
-    joypads[0] = buttons1;
-    joypads[1] = buttons2;
+    joypads[0] = buttons;
 }
 
 static void audioTask(void *arg)
