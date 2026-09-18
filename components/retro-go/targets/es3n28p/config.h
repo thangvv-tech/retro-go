@@ -43,19 +43,10 @@
     ILI9341_CMD(0xE0, 0x0F, 0x35, 0x31, 0x0B, 0x0E, 0x06, 0x49, 0xA7, 0x33, 0x07, 0x0F, 0x03, 0x0C, 0x0A, 0x00); \
     ILI9341_CMD(0xE1, 0x00, 0x0A, 0x0F, 0x04, 0x11, 0x08, 0x36, 0x58, 0x4D, 0x07, 0x10, 0x0C, 0x32, 0x34, 0x0F);
 
-// Gamepad - All buttons via PCF8574 (I2C), IO0=Secondary MENU (onboard BOOT button)
-#define RG_I2C_GPIO_DRIVER      5       // PCF8574
-#define RG_I2C_GPIO_ADDR        0x20    // A0/A1/A2 = GND
-
-#define RG_GAMEPAD_I2C_MAP { \
-    {RG_KEY_UP,     .num = 0, .level = 0}, \
-    {RG_KEY_DOWN,   .num = 1, .level = 0}, \
-    {RG_KEY_LEFT,   .num = 2, .level = 0}, \
-    {RG_KEY_RIGHT,  .num = 3, .level = 0}, \
-    {RG_KEY_A,      .num = 4, .level = 0}, \
-    {RG_KEY_B,      .num = 5, .level = 0}, \
-    {RG_KEY_SELECT, .num = 6, .level = 0}, \
-    {RG_KEY_START,  .num = 7, .level = 0}, \
+// Gamepad - IO0=Secondary MENU (onboard BOOT button); primary control via ESP-NOW / Web Gamepad
+// Note: Unpopulated I2C PCF8574 expander is disabled to prevent I2C bus timeouts
+#define RG_GAMEPAD_GPIO_MAP { \
+    {RG_KEY_MENU, GPIO_NUM_0, 1, 0, 0}, \
 }
 
 #define RG_GAMEPAD_VIRT_MAP { \

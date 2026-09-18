@@ -43,6 +43,7 @@ static uint32_t gamepad_mapped = 0;
 
 #if defined(RG_GAMEPAD_USE_ESPNOW) && defined(ESP_PLATFORM)
 #include <esp_idf_version.h>
+#include <esp_system.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_netif.h>
@@ -50,6 +51,10 @@ static uint32_t gamepad_mapped = 0;
 #include <nvs_flash.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+
+#define RG_RTC_CHANNEL_MAGIC 0x52474348 // 'RGCH'
+static RTC_NOINIT_ATTR uint32_t rtc_channel_magic;
+static RTC_NOINIT_ATTR uint8_t rtc_channel_val;
 
 #ifndef RG_GAMEPAD_WIFI_CHANNEL
 #define RG_GAMEPAD_WIFI_CHANNEL 1
@@ -334,6 +339,20 @@ static void espnow_gamepad_init(void)
         nvs_close(h);
     }
 
+    uint8_t init_chan = RG_GAMEPAD_WIFI_CHANNEL;
+#if defined(ESP_PLATFORM)
+    if (esp_reset_reason() == ESP_RST_SW &&
+        rtc_channel_magic == RG_RTC_CHANNEL_MAGIC &&
+        rtc_channel_val >= 1 && rtc_channel_val <= 13)
+    {
+        init_chan = rtc_channel_val;
+        RG_LOGI("ESP-NOW: Restored channel %d from RTC across reboot.", init_chan);
+    }
+    rtc_channel_magic = RG_RTC_CHANNEL_MAGIC;
+    rtc_channel_val = init_chan;
+#endif
+    espnow_current_channel = init_chan;
+
     wifi_mode_t mode;
     if (esp_wifi_get_mode(&mode) != ESP_OK)
     {
@@ -347,12 +366,12 @@ static void espnow_gamepad_init(void)
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
         esp_wifi_set_promiscuous(true);
-        esp_wifi_set_channel(RG_GAMEPAD_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_channel(init_chan, WIFI_SECOND_CHAN_NONE);
         esp_wifi_set_promiscuous(false);
     }
     else
     {
-        esp_wifi_set_channel(RG_GAMEPAD_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_channel(init_chan, WIFI_SECOND_CHAN_NONE);
     }
 
     esp_wifi_get_mac(WIFI_IF_STA, console_self_mac);
@@ -389,10 +408,20 @@ static void espnow_gamepad_init(void)
                        RG_KEY_L | RG_KEY_R);
 }
 
+uint8_t rg_input_espnow_get_channel(void)
+{
+    return espnow_current_channel;
+}
+
 void rg_input_espnow_notify_channel_switch(uint8_t new_channel)
 {
     if (new_channel < 1 || new_channel > 13)
         return;
+
+#if defined(ESP_PLATFORM)
+    rtc_channel_magic = RG_RTC_CHANNEL_MAGIC;
+    rtc_channel_val = new_channel;
+#endif
 
     uint8_t old_chan = espnow_current_channel;
     espnow_current_channel = new_channel;

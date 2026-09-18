@@ -56,7 +56,7 @@ static const char *TAG = "GAMEPAD";
 #define GAMEPAD_MAGIC 0x4752 // 'R', 'G'
 
 #define CHANNEL_HOP_INTERVAL_MS  120  // Dwell time per channel during search (120ms)
-#define CHANNEL_SYNC_TIMEOUT_MS  1200 // Timeout before triggering auto-scan if ACK lost (1.2s)
+#define CHANNEL_SYNC_TIMEOUT_MS  4000 // Timeout before triggering auto-scan if ACK lost (4.0s - covers console reboot)
 
 #define RG_ESPNOW_CMD_ACK          0xFFFF // Normal state ACK / PONG
 #define RG_ESPNOW_CMD_PAIR_REQ     0xFFFE // Gamepad -> Console: Request pairing
@@ -730,8 +730,9 @@ void app_main(void)
 
         // 5. Pairing & Auto Channel Hopping State Machine
         if (!is_paired) {
-            // Unpaired: Hop every CHANNEL_HOP_INTERVAL_MS and transmit PAIR_REQ
-            if (now_ms - last_hop_time >= CHANNEL_HOP_INTERVAL_MS) {
+            // Unpaired: Hop and transmit PAIR_REQ (gentle 500ms if SoftAP enabled to let phone connect)
+            int hop_interval = web_controller_enabled ? 500 : CHANNEL_HOP_INTERVAL_MS;
+            if (now_ms - last_hop_time >= hop_interval) {
                 current_channel = (current_channel % 13) + 1; // 1..13
                 set_gamepad_channel(current_channel);
                 last_hop_time = now_ms;
@@ -749,12 +750,15 @@ void app_main(void)
                 if (now_ms - last_ack_time > CHANNEL_SYNC_TIMEOUT_MS) {
                     channel_locked = false;
                     last_hop_time = now_ms;
-                    set_gamepad_channel(current_channel);
-                    ESP_LOGW(TAG, "Console sync lost. Scanning channels (1..13)...");
+                    if (current_channel != saved_channel) {
+                        set_gamepad_channel(saved_channel);
+                    }
+                    ESP_LOGW(TAG, "Console sync lost (%d ms). Scanning channels...", CHANNEL_SYNC_TIMEOUT_MS);
                 }
             } else {
-                // Searching channels: Hop every CHANNEL_HOP_INTERVAL_MS until ACK received
-                if (now_ms - last_hop_time >= CHANNEL_HOP_INTERVAL_MS) {
+                // Searching channels: gentle dwell time (1500ms) if SoftAP enabled to keep phone WiFi alive
+                int hop_interval = web_controller_enabled ? 1500 : CHANNEL_HOP_INTERVAL_MS;
+                if (now_ms - last_hop_time >= hop_interval) {
                     current_channel = (current_channel % 13) + 1;
                     set_gamepad_channel(current_channel);
                     last_hop_time = now_ms;
@@ -800,35 +804,37 @@ void app_main(void)
             }
         }
 
-        // 8. Power management: Enter light-sleep if idle (15s if searching, 60s if connected)
-        int64_t idle_timeout = channel_locked ? LIGHT_SLEEP_TIMEOUT_MS : 15000;
-        if (current_buttons == 0 && (now_ms - last_activity_time > idle_timeout)) {
-            ESP_LOGI(TAG, "Entering light-sleep mode (idle). Press any button to wake up.");
-            if (is_paired) {
-                packet.buttons = 0;
-                packet.seq = packet_seq++;
-                packet.player_id = active_player_id;
-                packet.channel = current_channel;
-                memcpy(packet.console_mac, paired_console_mac, 6);
-                esp_now_send(BROADCAST_MAC, (const uint8_t *)&packet, sizeof(packet));
+        // 8. Power management: Enter light-sleep only when Web Controller (SoftAP) is disabled
+        if (!web_controller_enabled) {
+            int64_t idle_timeout = channel_locked ? LIGHT_SLEEP_TIMEOUT_MS : 15000;
+            if (current_buttons == 0 && (now_ms - last_activity_time > idle_timeout)) {
+                ESP_LOGI(TAG, "Entering light-sleep mode (idle). Press any button to wake up.");
+                if (is_paired) {
+                    packet.buttons = 0;
+                    packet.seq = packet_seq++;
+                    packet.player_id = active_player_id;
+                    packet.channel = current_channel;
+                    memcpy(packet.console_mac, paired_console_mac, 6);
+                    esp_now_send(BROADCAST_MAC, (const uint8_t *)&packet, sizeof(packet));
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(20));
+                esp_wifi_stop();
+                esp_light_sleep_start();
+
+                // Woke up from light sleep: restore buttons and Wi-Fi stack
+                buttons_init();
+                esp_wifi_start();
+                set_gamepad_channel(current_channel);
+                esp_wifi_set_ps(WIFI_PS_NONE);
+                esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
+
+                now_ms = esp_timer_get_time() / 1000;
+                last_activity_time = now_ms;
+                web_last_activity = esp_timer_get_time();
+                last_sent_state = 0xFFFF; // Force instant transmission on wake
+                ESP_LOGI(TAG, "Woke up from light sleep.");
             }
-
-            vTaskDelay(pdMS_TO_TICKS(20));
-            esp_wifi_stop();
-            esp_light_sleep_start();
-
-            // Woke up from light sleep: restore buttons and Wi-Fi stack
-            buttons_init();
-            esp_wifi_start();
-            set_gamepad_channel(current_channel);
-            esp_wifi_set_ps(WIFI_PS_NONE);
-            esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
-
-            now_ms = esp_timer_get_time() / 1000;
-            last_activity_time = now_ms;
-            web_last_activity = esp_timer_get_time();
-            last_sent_state = 0xFFFF; // Force instant transmission on wake
-            ESP_LOGI(TAG, "Woke up from light sleep.");
         }
 
         vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));

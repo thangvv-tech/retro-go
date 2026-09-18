@@ -341,13 +341,14 @@ void rg_network_wifi_stop(void)
         return;
     network_state = RG_NETWORK_DISCONNECTED;
     #if defined(RG_GAMEPAD_USE_ESPNOW)
-    // Proactively notify gamepad to return to channel 1 before console switches channel
-    rg_input_espnow_notify_channel_switch(1);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    // Stay on current radio channel so ESP-NOW gamepad and SoftAP don't drop connection
+    uint8_t stay_chan = rg_input_espnow_get_channel();
+    if (stay_chan < 1 || stay_chan > 13)
+        stay_chan = 1;
     esp_wifi_disconnect();
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_channel(stay_chan, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_ps(WIFI_PS_NONE);
     // Keep wifi_config intact: ESP-NOW holds WiFi up, start() may reconnect immediately
